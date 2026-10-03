@@ -1684,6 +1684,15 @@ def optimized_affine_linear(linear, x: mx.array) -> Optional[mx.array]:
 
     x = mx.contiguous(x)
     try:
+        from ..verify_v8 import eligible as _v8_eligible, run as _v8_run
+
+        if _v8_eligible(linear, x):
+            return _v8_run(linear, x)
+    except Exception as e:
+        import logging
+
+        logging.getLogger(__name__).warning("verify_v8 fallback: %s", e)
+    try:
         from ..cpu_split import hybrid_eligible, hybrid_split_run
 
         if hybrid_eligible(linear, x):
