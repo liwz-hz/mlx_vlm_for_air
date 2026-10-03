@@ -3,6 +3,8 @@
 from functools import lru_cache
 from typing import Optional
 
+import os
+
 import mlx.core as mx
 import mlx.nn as nn
 
@@ -923,8 +925,8 @@ _TARGET_VERIFY_QMV_SOURCE = r"""
         const device uint8_t* wl = ws + row * in_vec_size_w;
         const device T* sl = sc + row * in_vec_size_g;
         const device T* bl = bs + row * in_vec_size_g;
-        float s = float(sl[0]);
-        float b = float(bl[0]);
+        float s = sl[0];
+        float b = bl[0];
         for (int t = 0; t < VERIFY_T; ++t) {
           result[t][row] += qdot_exact(wl, x_thread[t], s, b, sums[t]);
         }
@@ -995,8 +997,8 @@ _TARGET_VERIFY_QARGMAX_SOURCE = r"""
         const device uint8_t* wl = ws + row * in_vec_size_w;
         const device T* sl = sc + row * in_vec_size_g;
         const device T* bl = bs + row * in_vec_size_g;
-        float s = float(sl[0]);
-        float b = float(bl[0]);
+        float s = sl[0];
+        float b = bl[0];
         for (int t = 0; t < VERIFY_T; ++t) {
           result[t][row] += qdot_exact(wl, x_thread[t], s, b, sums[t]);
         }
@@ -1093,8 +1095,8 @@ _TARGET_VERIFY_QMV_TOKEN_TILED_SOURCE = r"""
         const device uint8_t* wl = ws + row * in_vec_size_w;
         const device T* sl = sc + row * in_vec_size_g;
         const device T* bl = bs + row * in_vec_size_g;
-        float s = float(sl[0]);
-        float b = float(bl[0]);
+        float s = sl[0];
+        float b = bl[0];
         for (int t = 0; t < token_count; ++t) {
           result[t][row] += qdot_exact(wl, x_thread[t], s, b, sums[t]);
         }
@@ -1165,8 +1167,8 @@ _TARGET_VERIFY_QARGMAX_TOKEN_TILED_SOURCE = r"""
         const device uint8_t* wl = ws + row * in_vec_size_w;
         const device T* sl = sc + row * in_vec_size_g;
         const device T* bl = bs + row * in_vec_size_g;
-        float s = float(sl[0]);
-        float b = float(bl[0]);
+        float s = sl[0];
+        float b = bl[0];
         for (int t = 0; t < token_count; ++t) {
           result[t][row] += qdot_exact(wl, x_thread[t], s, b, sums[t]);
         }
@@ -1675,6 +1677,194 @@ def _can_optimized_affine_linear(linear, x: mx.array) -> bool:
     return x.shape[-1] == K
 
 
+def _v6_qmv_header() -> str:
+    return (
+        r"""
+    using namespace metal;
+
+    constant constexpr int SIMD_SIZE = 32;
+    constant constexpr int PACK_FACTOR = 8;
+    constant constexpr int BYTES_PER_PACK = 4;
+    constant constexpr int PACKS_PER_THREAD = 2;
+    constant constexpr int VALUES_PER_THREAD = PACK_FACTOR * PACKS_PER_THREAD;
+    constant constexpr int BLOCK_SIZE = VALUES_PER_THREAD * SIMD_SIZE;
+    constant constexpr int GS = 64;
+    constant constexpr int RESULTS_PER_SIMDGROUP = 4;
+    constant constexpr int NUM_SIMDGROUPS = 2;
+    constant constexpr int BN = RESULTS_PER_SIMDGROUP * NUM_SIMDGROUPS;
+
+    inline float bf16_hi(uint u) {
+      return as_type<float>(u & 0xFFFF0000u);
+    }
+    inline float bf16_lo(uint u) {
+      return as_type<float>(u << 16);
+    }
+
+    template <typename T>
+    inline float load_vector_v6(const device T* x, thread float* x_thread) {
+      float sum = 0.0f;
+      const device uint4* xv = (const device uint4*)x;
+      #pragma unroll
+      for (int j = 0; j < VALUES_PER_THREAD / 8; j++) {
+        uint4 w4 = xv[j];
+        float v[8] = {
+            bf16_lo(w4.x), bf16_hi(w4.x),
+            bf16_lo(w4.y), bf16_hi(w4.y),
+            bf16_lo(w4.z), bf16_hi(w4.z),
+            bf16_lo(w4.w), bf16_hi(w4.w)};
+        #pragma unroll
+        for (int q = 0; q < 2; q++) {
+          sum += float(T(v[4 * q]) + T(v[4 * q + 1]) + T(v[4 * q + 2]) + T(v[4 * q + 3]));
+          x_thread[8 * j + 4 * q] = v[4 * q];
+          x_thread[8 * j + 4 * q + 1] = v[4 * q + 1];
+          x_thread[8 * j + 4 * q + 2] = v[4 * q + 2];
+          x_thread[8 * j + 4 * q + 3] = v[4 * q + 3];
+        }
+      }
+      return sum;
+    }
+
+    inline float qdot_v6(
+        const device uint8_t* w,
+        const thread float* x_thread,
+        float scale,
+        float bias,
+        float sum) {
+      float accum = 0.0f;
+      const device uint16_t* ws = (const device uint16_t*)w;
+      #pragma unroll
+      for (int i = 0; i < (VALUES_PER_THREAD / 4); i++) {
+        uint packed = ws[i];
+        accum +=
+            (x_thread[4 * i] * (packed & 0x000f) +
+             x_thread[4 * i + 1] * ((packed >> 4) & 0x000f) +
+             x_thread[4 * i + 2] * ((packed >> 8) & 0x000f) +
+             x_thread[4 * i + 3] * ((packed >> 12) & 0x000f));
+      }
+      return scale * accum + sum * bias;
+    }
+"""
+    )
+
+
+_V6_QMV_SOURCE = r"""
+    uint n_tile = threadgroup_position_in_grid.y;
+    uint b_idx = threadgroup_position_in_grid.z;
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint simd_lid = thread_index_in_simdgroup;
+
+    int out_row = int(n_tile) * BN + int(simd_gid) * RESULTS_PER_SIMDGROUP;
+    int in_vec_size_w = K_SIZE * BYTES_PER_PACK / PACK_FACTOR;
+    int in_vec_size_g = K_SIZE / GS;
+
+    const device uint8_t* ws_base =
+        (const device uint8_t*)w + out_row * in_vec_size_w +
+        int(simd_lid) * PACKS_PER_THREAD * BYTES_PER_PACK;
+    const device T* scales_base =
+        scales + out_row * in_vec_size_g + int(simd_lid) / (GS / VALUES_PER_THREAD);
+    const device T* biases_base =
+        biases + out_row * in_vec_size_g + int(simd_lid) / (GS / VALUES_PER_THREAD);
+    const device T* x_base =
+        x + int(b_idx) * VERIFY_T * K_SIZE + int(simd_lid) * VALUES_PER_THREAD;
+
+    float result[VERIFY_T][RESULTS_PER_SIMDGROUP];
+    float x_thread[VERIFY_T][VALUES_PER_THREAD];
+    for (int t = 0; t < VERIFY_T; ++t) {
+      for (int row = 0; row < RESULTS_PER_SIMDGROUP; ++row) {
+        result[t][row] = 0.0f;
+      }
+    }
+
+    const device uint8_t* ws = ws_base;
+    const device T* sc = scales_base;
+    const device T* bs = biases_base;
+    const device T* xk = x_base;
+
+    for (int k = 0; k < K_SIZE; k += BLOCK_SIZE) {
+      float sums[VERIFY_T];
+      for (int t = 0; t < VERIFY_T; ++t) {
+        sums[t] = load_vector_v6<T>(xk + t * K_SIZE, x_thread[t]);
+      }
+      for (int row = 0; row < RESULTS_PER_SIMDGROUP; ++row) {
+        const device uint8_t* wl = ws + row * in_vec_size_w;
+        const device T* sl = sc + row * in_vec_size_g;
+        const device T* bl = bs + row * in_vec_size_g;
+        float s = sl[0];
+        float b = bl[0];
+        for (int t = 0; t < VERIFY_T; ++t) {
+          result[t][row] += qdot_v6(wl, x_thread[t], s, b, sums[t]);
+        }
+      }
+      ws += BLOCK_SIZE * BYTES_PER_PACK / PACK_FACTOR;
+      sc += BLOCK_SIZE / GS;
+      bs += BLOCK_SIZE / GS;
+      xk += BLOCK_SIZE;
+    }
+
+    for (int row = 0; row < RESULTS_PER_SIMDGROUP; ++row) {
+      int n = out_row + row;
+      for (int t = 0; t < VERIFY_T; ++t) {
+        float r = simd_sum(result[t][row]);
+        if (simd_lid == 0) {
+          y[(int(b_idx) * VERIFY_T + t) * N_SIZE + n] = T(r);
+        }
+      }
+    }
+"""
+
+_v6_kernel_cache: dict = {}
+
+
+def _v6_enabled() -> bool:
+    return os.environ.get("MLX_VLM_VERIFY_V6", "0") == "1"
+
+
+def _v6_eligible(linear, x: mx.array) -> bool:
+    return (
+        _v6_enabled()
+        and isinstance(linear, nn.QuantizedLinear)
+        and linear.mode == "affine"
+        and linear.bits == 4
+        and linear.group_size == 64
+        and "bias" not in linear
+        and x.dtype == mx.bfloat16
+        and x.ndim == 3
+        and 2 <= x.shape[1] <= 5
+        and x.shape[-1] % 512 == 0
+        and linear.weight.shape[0] % 8 == 0
+        and mx.metal.is_available()
+    )
+
+
+def _v6_run(linear, x: mx.array) -> mx.array:
+    B, T, K = x.shape
+    N = linear.weight.shape[0]
+    key = (T, K, N, x.dtype)
+    kernel = _v6_kernel_cache.get(key)
+    if kernel is None:
+        kernel = mx.fast.metal_kernel(
+            name="target_verify_qmv_v6_t%d_k%d_n%d" % (T, K, N),
+            input_names=["x", "w", "scales", "biases"],
+            output_names=["y"],
+            header=_v6_qmv_header(),
+            source=_V6_QMV_SOURCE,
+        )
+        _v6_kernel_cache[key] = kernel
+    return kernel(
+        inputs=[x, linear.weight, linear.scales, linear.biases],
+        template=[
+            ("T", x.dtype),
+            ("VERIFY_T", int(T)),
+            ("K_SIZE", int(K)),
+            ("N_SIZE", int(N)),
+        ],
+        grid=(32, 2 * (N // 8), B),
+        threadgroup=(32, 2, 1),
+        output_shapes=[(B, T, N)],
+        output_dtypes=[x.dtype],
+    )[0]
+
+
 def optimized_affine_linear(linear, x: mx.array) -> Optional[mx.array]:
     if not _can_optimized_affine_linear(linear, x):
         return None
@@ -1683,6 +1873,8 @@ def optimized_affine_linear(linear, x: mx.array) -> Optional[mx.array]:
     N = linear.weight.shape[0]
 
     x = mx.contiguous(x)
+    if _v6_eligible(linear, x):
+        return _v6_run(linear, x)
     streamed = linear.bits == 4 and 6 <= T <= 8
     token_tiled = linear.bits == 4 and T >= 6 and not streamed
     results_per_simdgroup = 1 if streamed else 4
@@ -1810,6 +2002,8 @@ def optimized_affine_linears(linears, x: mx.array):
     n_sizes = tuple(int(linear.weight.shape[0]) for linear in linears)
     total_n = sum(n_sizes)
     x = mx.contiguous(x)
+    if _v6_enabled() and all(_v6_eligible(linear, x) for linear in linears):
+        return tuple(_v6_run(linear, x) for linear in linears)
     streamed = bits == 4 and T >= 6
     kernel_factory = (
         _target_verify_fused_qmv_streamed_kernel

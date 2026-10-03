@@ -164,6 +164,8 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
 - CPU 分担算子：统一内存共享带宽/功耗，负优化
 - draft-block-size ≥ 6：超出 drafter 训练深度，接受率 79%→29% 崩塌
 - 自定义 skinny-M kernel（`tools/qmv_skinny.py` + `mlx_vlm/fast_qmv.py`，默认关闭）：微基准 M=2 gate/up 1.53×，但端到端 A/B 无差异——**根因：投机解码的 verify 热路径走 `mlx_vlm/models/quantized_verifier.py` 的专用融合 kernel，绕过 nn.QuantizedLinear**；nn 层 patch 只能拦到 drafter 层（~5% 轮时）。要优化 verify 需直接改 quantized_verifier.py 内部的 kernel
+- **verify kernel 深挖结论（v6 实验，`tools/qmv_verify_v6.py` + quantized_verifier.py 内 MLX_VLM_VERIFY_V6 开关，默认关）**：fork 的 `_target_verify_qmv_kernel` 实测以持续态带宽墙运行（~24-25 GB/s，与独立测量的机器持续墙一致），代数折叠/fp32 精确算术/跨 T 权重共享俱全。复刻其精确算术 + 向量化 x 加载的 v6 变体 bit-exact 但**慢 19-25%**（uint4 跨 t 行访问伤缓存）——verify kernel 层面已无同精度空间。剩余路径只有降字节数（3bit 权重，需下载对应 checkpoint）
+- **mlx.fast 三大陷阱（踩过，血泪）**：① `grid` 参数是**总线程数**（不是 threadgroup 数，需乘每組线程数）；② 同一 kernel 对象跨模板参数复用会得到**错误结果**（必须按 shape 缓存对象，fork 的 `@lru_cache` 正是为此）；③ 微基准不立即 `mx.eval` 会因输出缓冲复用产生 **rel=0 的假阳性**——务必换多组数据复验
 - 脏 APC 磁盘缓存会传染崩溃：drafter 损坏或异常退出后，`~/.cache/mlx-vlm/apc` 的缓存会让后续所有服务接受率崩塌，需删除后重启
 
 **突发/持续功耗墙（M5 无风扇 Air 的决定性约束）**：
