@@ -167,6 +167,7 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
 - **verify kernel 深挖结论（v6 实验，`tools/qmv_verify_v6.py` + quantized_verifier.py 内 MLX_VLM_VERIFY_V6 开关，默认关）**：fork 的 `_target_verify_qmv_kernel` 实测以持续态带宽墙运行（~24-25 GB/s，与独立测量的机器持续墙一致），代数折叠/fp32 精确算术/跨 T 权重共享俱全。复刻其精确算术 + 向量化 x 加载的 v6 变体 bit-exact 但**慢 19-25%**（uint4 跨 t 行访问伤缓存）——verify kernel 层面已无同精度空间。剩余路径只有降字节数（3bit 权重，需下载对应 checkpoint）
 - **mlx.fast 三大陷阱（踩过，血泪）**：① `grid` 参数是**总线程数**（不是 threadgroup 数，需乘每組线程数）；② 同一 kernel 对象跨模板参数复用会得到**错误结果**（必须按 shape 缓存对象，fork 的 `@lru_cache` 正是为此）；③ 微基准不立即 `mx.eval` 会因输出缓冲复用产生 **rel=0 的假阳性**——务必换多组数据复验
 - 脏 APC 磁盘缓存会传染崩溃：drafter 损坏或异常退出后，`~/.cache/mlx-vlm/apc` 的缓存会让后续所有服务接受率崩塌，需删除后重启
+- **运行时编译 kernel 的名称无源码哈希（重要坑）**：`quantized_verifier.py` 的 JIT kernel 按 `..._t{verify_t}_k{k}_n{n}_{dtype}` 命名，不含源码内容哈希。修改这些 kernel 源码后若编译过坏版本，同名路径可能被 GPU 驱动的 JIT 管线缓存关联坏二进制（磁盘无痕、重启清除）。症状：特定 `--draft-block-size`（即特定 verify_t）的接受率确定性崩塌（accepted≈1-6，输出仍正确），换 block 或重启即恢复。**修改 verify kernel 后务必做接受率回归测试；建议上游给 kernel 名加源码哈希**
 
 **突发/持续功耗墙（M5 无风扇 Air 的决定性约束）**：
 微基准实测同一 kernel：冷启动突发 **44.7 GB/s**，持续负载 100ms 后跌至 **~25 GB/s 并锁死**（powermetrics 可见频率 486-636MHz）。所有"理论性能"（9 TFLOPS 大 GEMM、60+ GB/s GEMV、0.21ms/token 带宽地板）都是突发窗口数字，**LLM 持续解码只能用持续态带宽（~25-35 GB/s 有效）**。两个独立 kernel 实现（MLX qmv_wide 与定制版）在持续态都撞同一堵墙——这是功耗墙不是 kernel 墙。结论：MTP block=4 的 5.9 tok/s 已贴近本机持续态物理上限；再往上只有降字节数（3bit 量化/小模型）或改善散热。
