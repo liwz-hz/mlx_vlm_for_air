@@ -63,6 +63,74 @@ SOURCE = """
 """
 
 
+SOURCE_V5 = """
+    const int row = threadgroup_position_in_grid.x;
+    const int lane = thread_position_in_threadgroup.x % 32;
+    const int sg = simdgroup_index_in_threadgroup;
+    const int n_groups = K / GROUP;
+    const int stride = 32 * NSG;
+
+    float acc[M];
+    for (int m = 0; m < M; m++) acc[m] = 0.0f;
+
+    const device uint* wrow = w + (size_t)row * (K / 8);
+    const device half* srow = s + (size_t)row * n_groups;
+    const device half* brow = b + (size_t)row * n_groups;
+
+    for (int g = sg * 32 + lane; g < n_groups; g += stride) {
+        const float sc = float(srow[g]);
+        const float bi = float(brow[g]);
+        const device uint* wp = wrow + g * (GROUP / 8);
+        half2 accn[M];
+        #pragma unroll
+        for (int m = 0; m < M; m++) accn[m] = half2(0.0h, 0.0h);
+        for (int c = 0; c < GROUP / 8; c++) {
+            uint packed = wp[c];
+            int base = g * GROUP + c * 8;
+            half2 nh[4];
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                uint byte = (packed >> (8 * i)) & 0xFF;
+                nh[i] = half2(half(byte & 0xF), half((byte >> 4) & 0xF));
+            }
+            #pragma unroll
+            for (int m = 0; m < M; m++) {
+                uint4 xw = *((const device uint4*)(x + (size_t)m * K + base));
+                half2 x0 = as_type<half2>(xw.x);
+                half2 x1 = as_type<half2>(xw.y);
+                half2 x2 = as_type<half2>(xw.z);
+                half2 x3 = as_type<half2>(xw.w);
+                accn[m] = fma(nh[0], x0, accn[m]);
+                accn[m] = fma(nh[1], x1, accn[m]);
+                accn[m] = fma(nh[2], x2, accn[m]);
+                accn[m] = fma(nh[3], x3, accn[m]);
+            }
+        }
+        #pragma unroll
+        for (int m = 0; m < M; m++) {
+            float dots = float(accn[m].x) + float(accn[m].y);
+            acc[m] = fma(sc, dots, acc[m]);
+            acc[m] = fma(bi, xsum[(size_t)m * n_groups + g], acc[m]);
+        }
+    }
+
+    threadgroup float partials[NSG][M];
+    for (int m = 0; m < M; m++) {
+        float v = simd_sum(acc[m]);
+        if (lane == 0) partials[sg][m] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (thread_position_in_threadgroup.x == 0) {
+        for (int m = 0; m < M; m++) {
+            float total = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < NSG; i++) total += partials[i][m];
+            out[(size_t)m * N + row] = half(total);
+        }
+    }
+"""
+
+
 def make_kernel():
     return mx.fast.metal_kernel(
         name="qmv_skinny",
@@ -70,6 +138,31 @@ def make_kernel():
         output_names=["out"],
         source=SOURCE,
     )
+
+
+def make_kernel_v5():
+    return mx.fast.metal_kernel(
+        name="qmv_skinny_v5",
+        input_names=["x", "w", "s", "b", "xsum", "K", "N"],
+        output_names=["out"],
+        source=SOURCE_V5,
+    )
+
+
+def qmv_skinny_v5(x, wq, s, b, kernel, M, group=64, nsg=1):
+    M_, K = x.shape
+    N = wq.shape[0]
+    n_groups = K // group
+    xsum = mx.sum(x.reshape(M_, n_groups, group).astype(mx.float32), axis=-1)
+    out = kernel(
+        inputs=[x, wq, s, b, xsum, K, N],
+        grid=(N * 32 * nsg, 1, 1),
+        threadgroup=(32 * nsg, 1, 1),
+        output_shapes=[(M_, N)],
+        output_dtypes=[mx.float16],
+        template=[("M", M), ("GROUP", group), ("NSG", nsg)],
+    )
+    return out[0]
 
 
 def qmv_skinny(x, wq, s, b, kernel, M, group=64, nsg=1):
