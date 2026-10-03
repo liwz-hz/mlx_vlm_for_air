@@ -1683,6 +1683,17 @@ def optimized_affine_linear(linear, x: mx.array) -> Optional[mx.array]:
     N = linear.weight.shape[0]
 
     x = mx.contiguous(x)
+    try:
+        from ..cpu_split import hybrid_eligible, hybrid_split_run
+
+        if hybrid_eligible(linear, x):
+            out = hybrid_split_run(linear, x)
+            if out is not None:
+                return out
+    except Exception as e:
+        import logging
+
+        logging.getLogger(__name__).warning("cpu_split fallback: %s", e)
     streamed = linear.bits == 4 and 6 <= T <= 8
     token_tiled = linear.bits == 4 and T >= 6 and not streamed
     results_per_simdgroup = 1 if streamed else 4
