@@ -163,7 +163,8 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
 - 整步 `mx.compile`：GPU 活跃度已 100%（无调度空隙），融合无收益空间
 - CPU 分担算子：统一内存共享带宽/功耗，负优化
 - draft-block-size ≥ 6：超出 drafter 训练深度，接受率 79%→29% 崩塌
-- 自定义 skinny-M kernel（`tools/qmv_skinny.py`，正确性已验证）：持续态仅 +10%——详见下节
+- 自定义 skinny-M kernel（`tools/qmv_skinny.py` + `mlx_vlm/fast_qmv.py`，默认关闭）：微基准 M=2 gate/up 1.53×，但端到端 A/B 无差异——**根因：投机解码的 verify 热路径走 `mlx_vlm/models/quantized_verifier.py` 的专用融合 kernel，绕过 nn.QuantizedLinear**；nn 层 patch 只能拦到 drafter 层（~5% 轮时）。要优化 verify 需直接改 quantized_verifier.py 内部的 kernel
+- 脏 APC 磁盘缓存会传染崩溃：drafter 损坏或异常退出后，`~/.cache/mlx-vlm/apc` 的缓存会让后续所有服务接受率崩塌，需删除后重启
 
 **突发/持续功耗墙（M5 无风扇 Air 的决定性约束）**：
 微基准实测同一 kernel：冷启动突发 **44.7 GB/s**，持续负载 100ms 后跌至 **~25 GB/s 并锁死**（powermetrics 可见频率 486-636MHz）。所有"理论性能"（9 TFLOPS 大 GEMM、60+ GB/s GEMV、0.21ms/token 带宽地板）都是突发窗口数字，**LLM 持续解码只能用持续态带宽（~25-35 GB/s 有效）**。两个独立 kernel 实现（MLX qmv_wide 与定制版）在持续态都撞同一堵墙——这是功耗墙不是 kernel 墙。结论：MTP block=4 的 5.9 tok/s 已贴近本机持续态物理上限；再往上只有降字节数（3bit 量化/小模型）或改善散热。

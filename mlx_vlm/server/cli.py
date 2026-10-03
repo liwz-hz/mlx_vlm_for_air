@@ -354,6 +354,10 @@ def main():
     if args.api_key:
         os.environ["MLX_VLM_SERVER_API_KEY"] = args.api_key
 
+    from ..fast_qmv import maybe_enable_from_env
+
+    maybe_enable_from_env()
+
     log_level = getattr(logging, args.log_level.upper(), logging.INFO)
     logging.basicConfig(
         level=log_level,
