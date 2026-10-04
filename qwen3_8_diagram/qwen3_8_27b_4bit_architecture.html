@@ -1,0 +1,707 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Qwen3.8-27B(4bit) 模型结构图 · mlx-vlm 实现</title>
+<style>
+:root{--bg:#0a0e1a;--card:#121a2e;--line:#233252;--text:#e6ecf8;--muted:#8fa0c2;--dim:#5c6b8c;--mono:'SF Mono',Menlo,Consolas,monospace}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--bg);color:var(--text);font-family:-apple-system,'PingFang SC','Noto Sans SC',sans-serif}
+header{position:sticky;top:0;z-index:20;background:rgba(10,14,26,.94);backdrop-filter:blur(8px);border-bottom:1px solid var(--line);padding:6px 14px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+header h1{font-size:14px;font-weight:700}
+header .sub{font-size:10.5px;color:var(--muted)}
+.toolbar{margin-left:auto;display:flex;gap:5px;flex-wrap:wrap}
+.btn{background:#16203a;border:1px solid #2c3f6b;color:var(--text);font-size:11px;border-radius:7px;padding:3px 9px;cursor:pointer}
+.btn:hover{border-color:#60a5fa}
+.btn.on{background:#1d3a5f;border-color:#60a5fa;color:#93c5fd}
+.legendbar{padding:4px 14px;border-bottom:1px solid var(--line);display:flex;gap:12px;flex-wrap:wrap;font-size:10.5px;color:var(--muted);align-items:center;background:#0c1220}
+.legendbar i{display:inline-block;width:11px;height:11px;border-radius:3px;margin-right:5px;vertical-align:-1px}
+.lg-e{display:inline-block;width:24px;height:0;border-top:2px solid #56688f;margin-right:5px;vertical-align:3px}
+.lg-e.res{border-color:#f472b6}
+.lg-e.sup{border-top-style:dashed;border-color:#a78bfa}
+.lg-e.loop{border-top-style:dashed;border-color:#8fa0c2}
+#stage{overflow:hidden;cursor:grab}
+#stage.drag{cursor:grabbing}
+svg{display:block;width:100%;height:auto;user-select:none}
+.nbox{fill:#131c31;stroke-width:1.6;cursor:pointer;transition:filter .15s}
+g.node:hover .nbox{filter:brightness(1.4)}
+.ntitle{fill:#e6ecf8;font-size:13.5px;font-weight:700;text-anchor:middle;pointer-events:none}
+.nsub{fill:#8fa0c2;font-size:10.5px;font-family:var(--mono);text-anchor:middle;pointer-events:none}
+.ibadge{fill:#0a0e1a;font-size:9px;font-weight:700;text-anchor:middle;pointer-events:none}
+.eflow{stroke:#56688f;stroke-width:2;fill:none}
+.eres{stroke:#f472b6;stroke-width:1.7;fill:none;opacity:.85}
+.esup{stroke:#a78bfa;stroke-width:1.6;fill:none;stroke-dasharray:6 5;opacity:.92}
+.eloop{stroke:#8fa0c2;stroke-width:1.8;fill:none;stroke-dasharray:8 6}
+.eredot{stroke:#34d399;stroke-width:1.8;fill:none;stroke-dasharray:7 6}
+g.chip{cursor:default}
+g.chip rect{fill:#0e1526;stroke:#2c3f6b;stroke-width:1}
+g.chip text{fill:#9fd8af;font-size:10.5px;font-family:var(--mono);text-anchor:middle}
+g.chip.key rect{stroke:#3f5a3a;fill:#0f1d16}
+g.chip.key text{fill:#7ee2a8}
+g.chip.dimlab{display:none}
+body.showdims g.chip.dimlab{display:inline}
+.secframe{fill:rgba(15,22,38,.42);stroke-width:1.5}
+.sectitle{font-size:18px;font-weight:800}
+.secsub{font-size:12px;fill:#8fa0c2}
+.pline{stroke:#3b4a6e;stroke-width:1;opacity:.6}
+.zoomline{stroke:#4a5c85;stroke-width:1.2;stroke-dasharray:5 6;fill:none;opacity:.4}
+.pw{font-size:12px;font-weight:650;text-anchor:middle}
+.pid{font-size:8.5px;font-family:var(--mono);text-anchor:middle;opacity:.75}
+.gcell{stroke-width:1}
+.gridcell{stroke-width:.5}
+.note{font-size:12px;fill:#8fa0c2}
+.note2{font-size:12px;fill:#c9d7f2}
+.ltitle{font-size:15px;font-weight:800;text-anchor:middle}
+#panel{position:fixed;top:0;right:0;bottom:0;width:430px;max-width:92vw;background:#0f1626;border-left:1px solid #2c3f6b;z-index:40;transform:translateX(105%);transition:transform .22s;overflow-y:auto;padding:20px 22px 30px}
+#panel.open{transform:none}
+#panel h2{font-size:16.5px;padding-right:30px}
+#panel .psub{font-size:11.5px;color:var(--muted);font-family:var(--mono);margin:5px 0 14px}
+#pclose{position:absolute;top:16px;right:16px;background:none;border:1px solid var(--line);color:var(--muted);border-radius:7px;width:28px;height:28px;cursor:pointer}
+.mtable{width:100%;border-collapse:collapse;font-size:11.8px}
+.mtable th{text-align:left;color:var(--dim);font-weight:500;font-size:10.5px;padding:5px 6px;border-bottom:1px solid var(--line)}
+.mtable td{padding:6px;border-bottom:1px solid #1b2740;vertical-align:top}
+.mtable td.k{color:var(--muted);white-space:nowrap;width:128px}
+.mtable td.v{font-family:var(--mono);font-size:10.8px;color:#c9d7f2}
+.mformula{background:#0c1424;border:1px solid var(--line);border-radius:8px;padding:9px 12px;font-family:var(--mono);font-size:11px;color:#bcd0f5;margin:12px 0;line-height:1.75;white-space:pre-wrap}
+.mnote{font-size:11.8px;color:var(--muted);line-height:1.7;margin-top:10px}
+.mnote b{color:var(--text)}
+footer{padding:5px 14px;border-top:1px solid var(--line);font-size:10.5px;color:var(--dim);line-height:1.5;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+footer .mono{font-family:var(--mono)}
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>Qwen3.8-27B(4bit) 模型结构图</h1>
+    <div class="sub">mlx-vlm 实现 · 示例:512×512 图片 +「请描述这张图片」· 全部维度为真实前向追踪值</div>
+  </div>
+  <div class="toolbar">
+    <button class="btn" data-jump="0">① 输入</button><button class="btn" data-jump="1">② 总览</button>
+    <button class="btn" data-jump="2">③ 视觉塔</button><button class="btn" data-jump="3">④ 解码器</button>
+    <button class="btn" data-jump="4">⑤ 输出</button>
+    <button class="btn" id="dimToggle">显示全部维度标注</button>
+    <button class="btn" id="resetView">重置视图</button>
+  </div>
+</header>
+<div class="legendbar">
+  <span><i style="background:#fbbf24"></i>文字/分词</span>
+  <span><i style="background:#22d3ee"></i>视觉编码</span>
+  <span><i style="background:#a78bfa"></i>组装/位置</span>
+  <span><i style="background:#fb923c"></i>线性注意力 ×48</span>
+  <span><i style="background:#60a5fa"></i>全局注意力 ×16</span>
+  <span><i style="background:#f472b6"></i>MLP ×64</span>
+  <span><i style="background:#34d399"></i>输出</span>
+  <span><span class="lg-e"></span>数据流</span>
+  <span><span class="lg-e res"></span>残差</span>
+  <span><span class="lg-e sup"></span>坐标/状态供给</span>
+  <span><span class="lg-e loop"></span>循环</span>
+  <span style="color:var(--dim)">| 滚轮缩放 · 拖拽平移 · 点击节点看输入/输出明细</span>
+</div>
+<div id="stage"><svg id="svg" xmlns="http://www.w3.org/2000/svg"></svg></div>
+<footer>权重:ModelScope 本地(未连 HuggingFace)· 语言模型 15.13GB(4bit·g64) + 视觉塔 0.92GB(bf16) · 实现:mlx_vlm/models/qwen3_5 + qwen3_vl/vision.py · 全部维度为真实前向追踪值(trace_forward.py → trace_output.json,1208 条记录)</footer>
+<aside id="panel">
+  <button id="pclose">✕</button>
+  <h2 id="ptitle"></h2>
+  <div class="psub" id="psub"></div>
+  <div id="pbody"></div>
+</aside>
+<script>
+'use strict';
+var NS='http://www.w3.org/2000/svg',svg=document.getElementById('svg');
+var W=2360,H=5090;svg.setAttribute('viewBox','0 0 '+W+' '+H);
+var gBg,gEdges,gNodes,gLabels;
+(function(){gBg=el('g',{});gEdges=el('g',{});gNodes=el('g',{});gLabels=el('g',{})})();
+function el(t,a,parent){var e=document.createElementNS(NS,t);for(var k in a)e.setAttribute(k,a[k]);(parent||svg).appendChild(e);return e}
+function txt(x,y,s,cls,parent,st){var t=el('text',{x:x,y:y,'class':cls||'note'},parent||gLabels);if(st)for(var k in st)t.setAttribute(k,st[k]);t.textContent=s;return t}
+var PAL={txt:'#fbbf24',vis:'#22d3ee',vio:'#a78bfa',lin:'#fb923c',fa:'#60a5fa',mlp:'#f472b6',ok:'#34d399',neu:'#8fa0c2'};
+var NODES={},dragged=false;
+function node(o){
+  var g=el('g',{'class':'node'},gNodes);
+  el('rect',{x:o.x,y:o.y,width:o.w,height:o.h,rx:11,'class':'nbox',stroke:o.c||PAL.neu},g);
+  var cx=o.x+o.w/2;
+  txt(cx,o.y+(o.s?25:o.h/2+5),o.t,'ntitle',g);
+  if(o.s)txt(cx,o.y+44,o.s,'nsub',g);
+  if(o.s2)txt(cx,o.y+60,o.s2,'nsub',g);
+  if(o.d){el('circle',{cx:o.x+o.w-14,cy:o.y+14,r:8,fill:o.c||PAL.neu},g);txt(o.x+o.w-14,o.y+17.5,'i','ibadge',g);}
+  if(o.loop){var lw=o.loop.length*8+26;
+    el('rect',{x:o.x+o.w-lw-8,y:o.y-13,width:lw,height:22,rx:11,fill:o.c||PAL.neu},g);
+    txt(o.x+o.w-8-lw/2,o.y+2.5,'\u27F3 '+o.loop,'',g,{fill:'#081018','font-size':'11px','font-weight':'700','text-anchor':'middle'});}
+  g.addEventListener('click',function(e){if(dragged)return;e.stopPropagation();openPanel(o.d)});
+  NODES[o.id]=o;return g;
+}
+function anchor(n,side,dx){dx=dx||0;
+  if(side==='r')return[n.x+n.w,n.y+n.h/2+dx];if(side==='l')return[n.x,n.y+n.h/2+dx];
+  if(side==='t')return[n.x+n.w/2+dx,n.y];return[n.x+n.w/2+dx,n.y+n.h];}
+function bpath(a,ss,b,es,bulge){
+  var sx=a[0],sy=a[1],ex=b[0],ey=b[1],c1,c2;
+  if(ss==='r')c1=[sx+Math.max(40,(ex-sx)*.5),sy];else if(ss==='l')c1=[sx-Math.max(40,(sx-ex)*.5),sy];
+  else if(ss==='b')c1=[sx,sy+Math.max(36,(ey-sy)*.5)];else c1=[sx,sy-Math.max(36,(sy-ey)*.5)];
+  if(es==='l')c2=[ex-Math.max(40,(ex-sx)*.5),ey];else if(es==='r')c2=[ex+Math.max(40,(sx-ex)*.5),ey];
+  else if(es==='t')c2=[ex,ey-Math.max(36,(ey-sy)*.5)];else c2=[ex,ey+Math.max(36,(sy-ey)*.5)];
+  if(bulge){if(ss==='b'&&es==='t'){c1=[sx+bulge,sy+(ey-sy)*.35];c2=[ex+bulge,ey-(ey-sy)*.35];}
+    else{c1=[sx+(ex-sx)*.3,sy+bulge];c2=[ex-(ex-sx)*.3,ey+bulge];}}
+  return 'M'+sx+','+sy+'C'+c1[0]+','+c1[1]+' '+c2[0]+','+c2[1]+' '+ex+','+ey;
+}
+function edge(o){
+  var a=anchor(NODES[o.f],o.fs||'r',o.fdx),b=anchor(NODES[o.t],o.ts||'l',o.tdx);
+  var p=el('path',{d:bpath(a,o.fs||'r',b,o.ts||'l',o.bulge),'class':o.cls||'eflow'},gEdges);
+  if(o.mk!==false)p.setAttribute('marker-end','url(#'+(o.mkc||'arr')+')');
+  if(o.label)chip((a[0]+b[0])/2+(o.dx||0),(a[1]+b[1])/2+(o.dy||0),o.label,o.key,o.d,o.cls==='esup'?'#a78bfa':null);
+  return p;
+}
+function fpath(d,cls,mk,mkc){var p=el('path',{d:d,'class':cls||'eflow'},gEdges);if(mk!==false)p.setAttribute('marker-end','url(#'+(mkc||'arr')+')');return p}
+var CHIPS=[];
+function chip(x,y,label,key,click,col){
+  var g=el('g',{'class':'chip'+(key?' key':' dimlab')},gLabels);
+  var w=label.length*(key?7.2:6.6)+20;
+  CHIPS.push({x:x,y:y,w:w,t:label,dim:!key});
+  el('rect',{x:x-w/2,y:y-12,width:w,height:24,rx:6},g);
+  txt(x,y+4,label,'',g,col?{fill:col}:{});
+  if(click){g.style.cursor='pointer';g.addEventListener('click',function(e){if(dragged)return;e.stopPropagation();openPanel(click)})}
+  return g;
+}
+(function(){var d=el('defs',{});
+  [['arr','#56688f',7],['arrp','#f472b6',6.5],['arrv','#a78bfa',6.5],['arrg','#34d399',6.5],['arrc','#22d3ee',6.5]].forEach(function(m){
+    var mk=el('marker',{id:m[0],viewBox:'0 0 10 10',refX:9,refY:5,markerWidth:m[2],markerHeight:m[2],orient:'auto-start-reverse'},d);
+    el('path',{d:'M0,0L10,5L0,10z',fill:m[1]},mk);});
+})();
+var SECS=[];
+function section(o){
+  el('rect',{x:o.x,y:o.y,width:o.w,height:o.h,rx:20,'class':'secframe',stroke:o.c},gBg);
+  txt(o.x+85,o.y+46,o.t,'sectitle',gBg,{fill:o.c});
+  txt(o.x+85,o.y+70,o.s,'secsub',gBg);
+  SECS.push(o);return o;
+}
+function zoomlink(n,sec){var a=NODES[n];
+  el('path',{'class':'zoomline',d:'M'+(a.x+14)+','+(a.y+a.h)+'L'+(sec.x+14)+','+sec.y},gBg);
+  el('path',{'class':'zoomline',d:'M'+(a.x+a.w-14)+','+(a.y+a.h)+'L'+(sec.x+sec.w-14)+','+sec.y},gBg);}
+function pill(x,y,w,h,word,id,bg,st,fg){
+  var g=el('g',{},gNodes);
+  el('rect',{x:x,y:y,width:w,height:h,rx:8,fill:bg,stroke:st,'stroke-width':1},g);
+  txt(x+w/2,y+h/2-2,word,'pw',g,{fill:fg});
+  txt(x+w/2,y+h/2+13,id,'pid',g,{fill:fg});
+  return g;}
+function resNode(id,cx,cy,d){var g=el('g',{},gNodes);
+  el('circle',{cx:cx,cy:cy,r:20,fill:'#131c31',stroke:PAL.mlp,'stroke-width':1.6},g);
+  txt(cx,cy+6,'\u2295','',g,{fill:'#e6ecf8','font-size':'16px','text-anchor':'middle'});
+  g.style.cursor='pointer';g.addEventListener('click',function(e){if(dragged)return;e.stopPropagation();openPanel(d)});
+  NODES[id]={x:cx-20,y:cy-20,w:40,h:40};return g;}
+</script>
+<script>
+/* ════════ ① 输入区 ════════ */
+section({x:40,y:40,w:W-80,h:930,c:PAL.txt,
+  t:'\u2460 输入:一句话和一张图,各自变成数字(全部真实数据)',
+  s:'274 个 token 的来历:4 开头符号 + 256 图像占位 + 4 问题字词 + 10 结尾符号。药丸下方绿色数字 = 词表编号'});
+
+node({id:'tokz',x:80,y:130,w:200,h:76,t:'分词器',s:'词表 248,320',c:PAL.txt,d:'tok1'});
+txt(80,242,'\u300C请描述这张图片\u300D的完整分词(含对话模板符号):');
+pill(80,258,100,46,'\u2039im_start\u203A','248045','#2c2413','#54431c','#ffd98a');
+pill(186,258,62,46,'user','846','#2c2413','#54431c','#ffd98a');
+pill(254,258,42,46,'\u21B5','198','#2c2413','#54431c','#ffd98a');
+pill(302,258,112,46,'\u2039vision_start\u203A','248053','#2c2413','#54431c','#ffd98a');
+pill(420,258,200,46,'\u3010 256 个图像占位 \u3011','id 248056 \u00D7256','rgba(34,211,238,.12)','#1b4a57','#8ae3f5');
+pill(626,258,44,46,'\u8BF7','96220','#25200f','#54431c','#ffe9a8');
+pill(676,258,60,46,'\u63CF\u8FF0','99172','#25200f','#54431c','#ffe9a8');
+pill(742,258,60,46,'\u8FD9\u5F20','112148','#25200f','#54431c','#ffe9a8');
+pill(808,258,60,46,'\u56FE\u7247','97904','#25200f','#54431c','#ffe9a8');
+pill(80,320,112,46,'\u2039vision_end\u203A','248054','rgba(34,211,238,.12)','#1b4a57','#8ae3f5');
+pill(198,320,96,46,'\u2039im_end\u203A','248046','#17233d','#26355c','#9ec2ff');
+pill(300,320,124,46,'\u21B5\u2039im_start\u203A','198\u00B7248045','#17233d','#26355c','#9ec2ff');
+pill(430,320,120,46,'assistant\u21B5','74455\u00B7198','#17233d','#26355c','#9ec2ff');
+pill(556,320,226,46,'\u2039think\u203A\u21B5\u21B5\u2039/think\u203A\u21B5\u21B5','248068\u00B7271\u00B7248069\u00B7271','#17233d','#26355c','#9ec2ff');
+node({id:'tokcnt',x:80,y:392,w:620,h:74,t:'input_ids  [1 \u00D7 274]',s:'4 \u5F00\u5934 + 256 \u56FE\u50CF\u5360\u4F4D + 4 \u95EE\u9898 + 10 \u7ED3\u5C3E = 274',c:PAL.txt,d:'tokseq'});
+
+(function(){var g=el('g',{},gNodes);
+  var clip=el('clipPath',{id:'imc1'},el('defs',{}));
+  el('rect',{x:0,y:0,width:150,height:150,rx:12},clip);
+  var ig=el('g',{'clip-path':'url(#imc1)'},g);
+  el('image',{x:1210,y:130,width:150,height:150,preserveAspectRatio:'xMidYMid slice',href:'sample_input.png'},ig);
+  el('rect',{x:1210,y:130,width:150,height:150,rx:12,fill:'none',stroke:PAL.vis,'stroke-width':1.5},g);
+  txt(1285,304,'512 \u00D7 512 RGB','note2',g,{'text-anchor':'middle'});})();
+node({id:'imgproc',x:1420,y:130,w:340,h:150,t:'\u56FE\u50CF\u5904\u7406\u5668\uFF1A\u5207 16\u00D716 \u8865\u4E01',s:'512\u00F716=32 \u2192 32\u00D732=1024 \u5757',s2:'\u6BCF\u5757 3\u8272\u00D72\u5E27\u00D716\u00D716=1536 \u4E2A\u6570',c:PAL.vis,d:'img2'});
+(function(){var g=el('g',{},gNodes);var X=1830,Y=120,S=168,st=S/8;
+  var clip=el('clipPath',{id:'imc2'},el('defs',{}));
+  el('rect',{x:0,y:0,width:S,height:S,rx:8},clip);
+  var ig=el('g',{'clip-path':'url(#imc2)'},g);
+  el('image',{x:X,y:Y,width:S,height:S,preserveAspectRatio:'xMidYMid slice',href:'sample_input.png'},ig);
+  for(var i=1;i<8;i++){el('path',{'class':'pline',d:'M'+(X+i*st)+','+Y+'v'+S},g);el('path',{'class':'pline',d:'M'+X+','+(Y+i*st)+'h'+S},g);}
+  el('rect',{x:X,y:Y,width:S,height:S,rx:8,fill:'none',stroke:PAL.vis,'stroke-width':1.5},g);
+  txt(X+S/2,Y+S+22,'\u5207\u8865\u4E01\u793A\u610F(\u5B9E\u9645 32\u00D732 = 1024 \u5757)','note',g,{'text-anchor':'middle'});})();
+chip(1965,352,'pixel_values [1024\u00D71536] \u00B7 grid [1,32,32]',true,'img2');
+txt(390,486,'\u6587\u5B57\u8DEF \u2193');txt(1965,486,'\u56FE\u7247\u8DEF \u2193',null,null,{'text-anchor':'middle'});
+fpath('M390,466C390,760 70,800 70,1120L70,1430C70,1450 82,1455 98,1455');
+fpath('M1965,376C1965,660 700,640 700,1050L700,1112L265,1112L265,1122');
+chip(210,1000,'\u6587\u5B57\u8DEF\uFF1A274 \u4E2A\u7F16\u53F7 \u2192 \u8BCD\u5D4C\u5165',true,'tokseq');
+chip(1082,700,'\u56FE\u7247\u8DEF\uFF1A\u8865\u4E01\u8868\u683C (1024,1536) \u2192 \u89C6\u89C9\u5854',true,'img2');
+
+/* ════════ ② 总览流水线 ════════ */
+var sec2=section({x:40,y:1020,w:W-80,h:740,c:PAL.vis,
+  t:'\u2461 \u603B\u4F53\u6D41\u6C34\u7EBF\uFF1A\u4E24\u8DEF\u8F93\u5165 \u2192 \u6C47\u6210\u4E00\u6761\u5E8F\u5217 \u2192 64 \u5C42\u89E3\u7801 \u2192 \u8F93\u51FA',
+  s:'\u6A21\u578B\u7684\u201C\u5730\u56FE\u201D\uFF1B\u2462\u2463\u2464 \u662F\u865A\u7EBF\u6307\u5411\u7684\u653E\u5927\u5C55\u5F00\u56FE'});
+
+node({id:'vt',x:100,y:1130,w:330,h:150,t:'\u89C6\u89C9\u7F16\u7801\u5668 ViT',s:'\u27F3 Block \u00D727 \u00B7 1152 \u7EF4 \u00B7 bf16',s2:'0.92GB \u00B7 \u4E0D\u91CF\u5316',c:PAL.vis,d:'tower33',loop:'\u00D727'});
+node({id:'mg',x:510,y:1130,w:300,h:150,t:'PatchMerger \u7A7A\u95F4\u5408\u5E76',s:'2\u00D72 \u5408\u5E76\uFF1A1024\u2192256',s2:'\u6295\u5F71 1152\u00D74 \u2192 5120',c:PAL.vis,d:'merge34'});
+node({id:'eb',x:100,y:1380,w:330,h:150,t:'\u8BCD\u5D4C\u5165 embed_tokens',s:'248,320 \u00D7 5120 \u00B7 4bit',s2:'\u6BCF\u4E2A\u7F16\u53F7 \u2192 5120 \u7EF4\u5411\u91CF',c:PAL.txt,d:'embed41'});
+node({id:'asm',x:510,y:1380,w:300,h:150,t:'\u5E8F\u5217\u7EC4\u88C5',s:'\u56FE\u50CF\u5360\u4F4D \u2192 \u89C6\u89C9\u7279\u5F81',s2:'masked_scatter \u66FF\u6362',c:PAL.vio,d:'scatter42'});
+node({id:'mrope',x:880,y:1560,w:300,h:150,t:'MRoPE \u4F4D\u7F6E\u5750\u6807',s:'(3,1,274) \u00B7 t/h/w \u4E09\u8F74',s2:'\u5168\u573A\u53EA\u7B97 1 \u6B21 \u2192 16 \u4E2A\u5168\u5C40\u5C42\u5171\u7528',c:PAL.vio,d:'mrope43'});
+var decG=node({id:'dec',x:1330,y:1120,w:480,h:210,t:'Transformer \u89E3\u7801\u5668',s:'\u27F3 64 \u5C42 = 16 \u7EC4 \u00D7 [\u7EBF,\u7EBF,\u7EBF,\u5168]',s2:'h [1,274,5120] \u9010\u5C42\u6539\u5199 \u00B7 \u5F62\u72B6\u4E0D\u53D8',c:PAL.lin,d:'decoder5',loop:'\u00D764'});
+(function(){var X=1345,Y=1284;
+  for(var i=0;i<12;i++){var fa=(i%4===3);
+    el('rect',{x:X+i*39,y:Y,width:34,height:22,rx:4,'class':'gcell',fill:fa?PAL.fa:PAL.lin,opacity:.82},decG);}
+  txt(X+6,Y-10,'\u2026 \u5171 64 \u5C42(\u5B8C\u6574\u6392\u5E03\u89C1 \u2463)','',decG,{fill:'#8fa0c2','font-size':'11px','text-anchor':'middle'});})();
+node({id:'hd',x:1900,y:1120,w:360,h:210,t:'\u8F93\u51FA\u5934',s:'RMSNorm \u2192 lm_head',s2:'5120 \u2192 248,320 \u00B7 4bit',c:PAL.ok,d:'head61'});
+node({id:'outn',x:1330,y:1420,w:480,h:170,t:'logits \u2192 \u4E0B\u4E00\u4E2A token',s:'[1,274,248320] \u00B7 \u672B\u4F4D argmax',s2:'\u672C\u6B21\u771F\u5B9E\u7ED3\u679C\uFF1A\u300C\u8FD9\u5F20\u300D(id 112148)',c:PAL.ok,d:'gen62'});
+
+edge({f:'vt',fs:'r',t:'mg',ts:'l',label:'(1024,1152)',dy:-95});
+edge({f:'mg',fs:'b',t:'asm',ts:'t',label:'\u89C6\u89C9\u7279\u5F81 (256,5120)',key:true,d:'merge34',dx:125,dy:8});
+edge({f:'eb',fs:'r',t:'asm',ts:'l',label:'(1,274,5120)',dy:-90});
+edge({f:'asm',fs:'r',t:'dec',ts:'l',fdx:-20,label:'inputs_embeds (1,274,5120)',key:true,d:'scatter42',dy:0});
+edge({f:'mrope',fs:'t',t:'dec',ts:'b',tdx:-160,cls:'esup',mkc:'arrv',label:'\u5750\u6807 (3,1,274)',key:true,d:'mrope43'});
+edge({f:'dec',fs:'r',t:'hd',ts:'l',label:'h (1,274,5120)',dy:-125});
+edge({f:'hd',fs:'b',t:'outn',ts:'r',label:'logits (1,274,248320)',key:true,d:'head61'});
+fpath('M1810,1505C2120,1505 2295,1480 2295,1400L2295,1078C2295,1064 2230,1060 2160,1060L1560,1060L1560,1118','eredot','arrg');
+chip(1900,1042,'\u27F2 \u751F\u6210\u7684 token \u63A5\u56DE\u5E8F\u5217\u5C3E \u2192 \u91CD\u65B0\u8FDB\u5165\u89E3\u7801\u5668(\u4EC5\u7B97\u65B0 token)',true,'gen62');
+txt(2080,1372,'\u2464 \u5C55\u5F00\u89C1\u4E0B\u65B9','note');
+</script>
+<script>
+/* ════════ ③ 视觉塔展开 ════════ */
+var sec3=section({x:40,y:1840,w:W-80,h:1100,c:PAL.vis,
+  t:'\u2462 \u89C6\u89C9\u7F16\u7801\u5668\u5185\u90E8\u5C55\u5F00\uFF08\u27F3 \u540C\u4E00 Block \u7ED3\u6784\u4E32\u884C 27 \u6B21\uFF09',
+  s:'\u5F62\u72B6\u5168\u7A0B (1024,1152)\uFF1B27 \u6B21\u5FAA\u73AF\u628A\u201C\u50CF\u7D20\u201D\u63D0\u70BC\u6210\u201C\u8BED\u4E49\u201D'});
+node({id:'pv3',x:100,y:1930,w:220,h:60,t:'pixel_values',s:'[1024,1536]',c:PAL.vis,d:'img2'});
+node({id:'cv3',x:100,y:2040,w:260,h:110,t:'Conv3d \u8865\u4E01\u5D4C\u5165',s:'k=2\u00B716\u00B716 \u00B7 3\u21921152',s2:'\u4E00\u6B21\u5B8C\u6210\u65F6\u95F4\u5408\u5E76+\u5207\u5757',c:PAL.vis,d:'conv31'});
+node({id:'pe3',x:400,y:1900,w:250,h:100,t:'pos_embed \u4F4D\u7F6E\u7F16\u7801',s:'48\u00D748 \u8868 \u2192 \u53CC\u7EBF\u6027\u63D2\u503C',s2:'(4,1024,1152)\u2192(1024,1152)',c:PAL.vis,d:'pos32'});
+(function(){var g=el('g',{},gNodes);
+  el('circle',{cx:430,cy:2100,r:23,fill:'#131c31',stroke:PAL.vis,'stroke-width':1.6},g);
+  txt(430,2106,'\u2295','',g,{fill:'#e6ecf8','font-size':'15px','text-anchor':'middle'});
+  g.style.cursor='pointer';g.addEventListener('click',function(e){if(dragged)return;openPanel('pos32')});})();
+NODES['addpos3']={x:407,y:2077,w:46,h:46};
+node({id:'vr3',x:400,y:2250,w:250,h:100,t:'2D-RoPE \u9891\u7387\u8868',s:'(32,18) \u2192 (1024,36)',s2:'\u884C/\u5217\u5750\u6807\u5404 18 \u9891\u7387',c:PAL.vis,d:'virope2'});
+
+el('rect',{x:720,y:1900,width:620,height:1000,rx:18,fill:'rgba(34,211,238,.05)',stroke:PAL.vis,'stroke-width':1.6,'stroke-dasharray':'10 7'},gBg);
+txt(1030,1942,'\u27F3 ViT Block \u00D7 27\uFF08\u5FAA\u73AF\u4F53\u5185\u90E8\uFF09','sectitle',gBg,{fill:PAL.vis,'text-anchor':'middle'});
+txt(1030,1966,'\u540C\u4E00\u7ED3\u6784\u4E32\u884C\u6267\u884C 27 \u6B21 \u00B7 \u8F93\u5165/\u8F93\u51FA\u5747 (1024,1152)','secsub',gBg,{'text-anchor':'middle'});
+(function(){var CX=890,Wd=260;
+  var seq=[['LayerNorm',PAL.vis],['qkv Linear 1152\u21923456',PAL.fa],['2D-RoPE + SDPA 16\u5934\u00D772',PAL.fa],['proj 1152\u21921152',PAL.fa],['RES',0],['LayerNorm',PAL.vis],['fc1 1152\u21924304 +GELU',PAL.mlp],['fc2 4304\u21921152',PAL.mlp],['RES',0]];
+  var yy=2160;
+  seq.forEach(function(s,i){
+    if(s[1]===0){resNode('vb'+i,CX,yy+20,'viblock');yy+=66;}
+    else{node({id:'vb'+i,x:CX-Wd/2,y:yy,w:Wd,h:46,t:s[0],c:s[1],d:'viblock'});yy+=64;}
+  });
+  for(var i=0;i<8;i++){var a=NODES['vb'+i],b=NODES['vb'+(i+1)];
+    fpath('M'+CX+','+(a.y+a.h)+'V'+b.y,'eflow');}
+  fpath('M453,2100C580,2100 640,2183 756,2183');
+  fpath('M890,2721V2790H1380V2095H1415');
+  fpath('M910,2701C1300,2701 1300,2120 890,2120L890,2152','eloop');
+  chip(1292,2400,'\u91CD\u590D 27 \u6B21',true,'tower33');
+  chip(690,2135,'\u8FDB (1024,1152) \u00D727');
+})();
+node({id:'mrsh',x:1420,y:2040,w:300,h:110,t:'reshape 2\u00D72 \u7A7A\u95F4\u5408\u5E76',s:'(1024,1152)\u2192(256,4608)',s2:'\u76F8\u90BB 2\u00D72 \u8865\u4E01\u62FC\u6210 1 \u4E2A\u89C6\u89C9 token',c:PAL.vis,d:'merge34'});
+node({id:'mf1',x:1420,y:2220,w:300,h:90,t:'merger fc1 + GELU',s:'4608 \u2192 4608',c:PAL.vis,d:'merge34'});
+node({id:'mf2',x:1420,y:2360,w:300,h:90,t:'merger fc2',s:'4608 \u2192 5120',c:PAL.vis,d:'merge34'});
+node({id:'vfchip',x:1420,y:2500,w:300,h:70,t:'\u89C6\u89C9\u7279\u5F81 [256,5120]',s:'256 \u4E2A\u89C6\u89C9 token \u00B7 \u7EF4\u5EA6\u5DF2\u5BF9\u9F50\u8BED\u8A00\u6A21\u578B',c:PAL.vis,d:'merge34'});
+txt(1570,2610,'\u2192 \u9001\u5165 \u2461 \u7684\u5E8F\u5217\u7EC4\u88C5\uFF08\u66FF\u6362 256 \u4E2A\u56FE\u50CF\u5360\u4F4D\uFF09','note',null,{'text-anchor':'middle'});
+node({id:'vsum',x:1800,y:2040,w:480,h:530,t:'\u89C6\u89C9\u5854\u89C4\u683C\u5361',s:'\u70B9\u51FB\u67E5\u770B\u5B8C\u6574\u53C2\u6570\u4E0E\u7EF4\u5EA6',c:PAL.vis,d:'visum'});
+(function(){var rows=[['\u8865\u4E01\u5D4C\u5165 Conv3d','\u2248177 \u4E07\u53C2\u6570'],['\u4F4D\u7F6E\u8868 48\u00D748','\u2248265 \u4E07'],['\u5355\u4E2A Block','\u22481,524 \u4E07'],['\u00D727 Blocks','\u22484.12 \u4EBF'],['Merger','\u22484,480 \u4E07'],['\u5408\u8BA1','\u22484.6 \u4EBF \u00B7 0.92GB'],['\u7CBE\u5EA6','\u5168\u7A0B bf16\uFF0C\u4E0D\u91CF\u5316'],['\u6CE8\u610F\u529B','16 \u5934 \u00D7 72 \u7EF4 \u00B7 2D-RoPE'],['\u6FC0\u6D3B','GELU(tanh)'],['\u5FAA\u73AF\u4F53','\u770B\u90BB\u5C45+\u60F3\u4E00\u60F3\uFF0C\u5404\u5E26\u6B8B\u5DEE']];
+  rows.forEach(function(r,i){txt(1830,2190+i*42,r[0],'note',gLabels);txt(2250,2190+i*42,r[1],'note2',gLabels,{'text-anchor':'end'});});})();
+edge({f:'pv3',fs:'b',t:'cv3',ts:'t'});
+edge({f:'cv3',fs:'r',t:'addpos3',ts:'l'});
+edge({f:'pe3',fs:'b',t:'addpos3',ts:'t'});
+fpath('M650,2300C700,2300 710,2311 756,2311','esup',true,'arrv');
+edge({f:'mrsh',fs:'b',t:'mf1',ts:'t'});
+edge({f:'mf1',fs:'b',t:'mf2',ts:'t'});
+edge({f:'mf2',fs:'b',t:'vfchip',ts:'t'});
+txt(265,1315,'\u2462 \u5C55\u5F00\u89C1\u4E0B\u65B9 \u2193','note',null,{'text-anchor':'middle'});
+
+/* ════════ ④ 解码器展开 ════════ */
+var sec4=section({x:40,y:3020,w:W-80,h:1260,c:PAL.lin,
+  t:'\u2463 \u89E3\u7801\u5668\u5185\u90E8\u5C55\u5F00\uFF1A\u27F3 64 \u5C42 = 16 \u7EC4 \u00D7 [\u7EBF\u6027,\u7EBF\u6027,\u7EBF\u6027,\u5168\u5C40]',
+  s:'\u5DE6\uFF1A\u5C42\u7684\u7F16\u6392\u4E0E\u7F13\u5B58 | \u4E2D\uFF1A\u4E24\u79CD\u6CE8\u610F\u529B\u5C42\u5185\u90E8\uFF08\u771F\u5B9E\u7EF4\u5EA6\uFF09| \u53F3\uFF1A\u6BCF\u5C42\u5171\u7528\u7684 MLP \u4E0E\u9AA8\u67B6'});
+/* 4A 左列 */
+node({id:'grp',x:100,y:3100,w:340,h:190,t:'\u4E00\u7EC4 = 4 \u5C42',s:'[\u7EBF][\u7EBF][\u7EBF][\u5168] \u00D7 16 \u7EC4 = 64 \u5C42',c:PAL.lin,d:'decoder5'});
+(function(){var cs=[[PAL.lin,'\u7EBF\u6027'],[PAL.lin,'\u7EBF\u6027'],[PAL.lin,'\u7EBF\u6027'],[PAL.fa,'\u5168\u5C40']];
+  cs.forEach(function(c,i){el('rect',{x:118+i*78,y:3200,width:70,height:52,rx:8,'class':'gcell',fill:c[0],opacity:.85},gNodes);
+    txt(118+i*78+35,3231,c[1],'',gNodes,{fill:'#081018','font-size':'13px','font-weight':'700','text-anchor':'middle'});});
+  txt(418,3232,'\u00D716','',gNodes,{fill:'#8fa0c2','font-size':'17px','font-weight':'700'});})();
+txt(270,3352,'64 \u5C42\u771F\u5B9E\u6392\u5E03\uFF08\u60AC\u505C\u770B\u5C42\u53F7\uFF09','sectitle',gLabels,{'text-anchor':'middle','fill':'#e6ecf8'});
+(function(){var X=118,Y=3375,cw=34,ch=24;
+  for(var i=0;i<64;i++){var r=Math.floor(i/8),col=i%8,fa=((i+1)%4===0);
+    var rc=el('rect',{x:X+col*(cw+5)+(col>=4?12:0),y:Y+r*(ch+6),width:cw,height:ch,rx:4,'class':'gridcell',fill:fa?PAL.fa:PAL.lin,opacity:.9},gNodes);
+    var tt=el('title',{},rc);tt.textContent='\u7B2C '+(i+1)+' \u5C42 \u00B7 '+(fa?'\u5168\u5C40\u6CE8\u610F\u529B':'\u7EBF\u6027\u6CE8\u610F\u529B');}
+  txt(270,3660,'\u6A59=\u7EBF\u6027\u6CE8\u610F\u529B\uFF0848\uFF09 \u84DD=\u5168\u5C40\u6CE8\u610F\u529B\uFF0816\uFF09','note',gLabels,{'text-anchor':'middle'});
+  var hit=el('rect',{x:100,y:3330,width:340,height:340,fill:'transparent'},gNodes);hit.style.cursor='pointer';
+  hit.addEventListener('click',function(e){if(dragged)return;openPanel('decoder5')});})();
+node({id:'hcard',x:100,y:3700,w:340,h:100,t:'h [1,274,5120]',s:'64 \u5C42\u5F62\u72B6\u4E0D\u53D8 \u00B7 \u9010\u5C42\u7CBE\u52A0\u5DE5',c:PAL.lin,d:'decoder5'});
+node({id:'cch',x:100,y:3830,w:340,h:230,t:'\u6BCF\u5C42\u81EA\u5E26\u72B6\u6001\u7F13\u5B58',s:'make_cache() \u9884\u5EFA 64 \u4EFD',c:PAL.lin,d:'cache5'});
+(function(){txt(120,3935,'\u7EBF\u6027\u5C42\uFF1AArraysCache(2)','note',gLabels);
+  txt(130,3963,'conv_state [1,3,10240]','note2',gLabels);
+  txt(130,3991,'\u9012\u5F52\u72B6\u6001 S [1,48,128,128] fp32','note2',gLabels);
+  txt(120,4029,'\u5168\u5C40\u5C42\uFF1AKVCache','note',gLabels);
+  txt(130,4057,'k,v [1,4,T,256] \u00B7 prefill \u540E T=274','note2',gLabels);})();
+node({id:'mixc',x:100,y:4080,w:340,h:170,t:'\u4E3A\u4EC0\u4E48 3:1 \u6DF7\u5408\uFF1F',c:PAL.lin,d:'mixnote'});
+(function(){txt(120,4155,'\u7EBF\u6027(75%)\uFF1A\u5E26\u56FA\u5B9A\u8D26\u672C\u987A\u5E8F\u7FFB\u9605\uFF0C','note',gLabels);
+  txt(120,4179,'\u625B\u8D85\u957F\u4E0A\u4E0B\u6587\uFF0826 \u4E07 token\uFF09','note',gLabels);
+  txt(120,4211,'\u5168\u5C40(25%)\uFF1A\u56DE\u5934\u7CBE\u8BFB\u5168\u90E8 274 \u4E2A token\uFF0C','note',gLabels);
+  txt(120,4235,'\u4FDD\u5173\u952E\u4FE1\u606F\u4E0D\u4E22\u3002\u517C\u987E\u201C\u957F\u201D\u4E0E\u201C\u51C6\u201D','note',gLabels);})();
+/* 4B 线性注意力层 */
+el('rect',{x:470,y:3120,width:620,height:1080,rx:18,fill:'rgba(251,146,60,.05)',stroke:PAL.lin,'stroke-width':1.6},gBg);
+txt(780,3162,'\u7EBF\u6027\u6CE8\u610F\u529B\u5C42 \u00D748 \u00B7 GatedDeltaNet','sectitle',gBg,{fill:'#fdba74','text-anchor':'middle'});
+txt(780,3186,'\u4EE5\u7B2C 0 \u5C42\u771F\u5B9E\u6570\u636E\u4E3A\u4F8B \u00B7 L=274','secsub',gBg,{'text-anchor':'middle'});
+(function(){var X=500,Wd=260,CX=630;
+  node({id:'gin',x:X,y:3200,w:Wd,h:40,t:'x [1,274,5120]',c:PAL.lin,d:'gdn'});
+  node({id:'gln',x:X,y:3265,w:Wd,h:46,t:'RMSNorm',c:PAL.lin,d:'gdn'});
+  node({id:'gqkv',x:X,y:3329,w:Wd,h:54,t:'in_proj_qkv',s:'5120\u219210240 = q\u2044k\u2044v',c:PAL.lin,d:'gdn'});
+  node({id:'gzab',x:X,y:3403,w:Wd,h:54,t:'in_proj_z / a / b',s:'\u21926144 / 48 / 48',c:PAL.lin,d:'gdn'});
+  node({id:'gconv',x:X,y:3477,w:Wd,h:62,t:'\u56E0\u679C Conv1d k=4 + SiLU',s:'[1,277,10240]\u2192[1,274,10240]',c:PAL.lin,d:'gdn'});
+  node({id:'gspl',x:X,y:3559,w:Wd,h:54,t:'\u62C6 48 \u5934 + L2 \u5F52\u4E00\u5316',s:'q,k:[16\u00D7128] \u00B7 v:[48\u00D7128]',c:PAL.lin,d:'gdn'});
+  node({id:'gcore',x:X,y:3633,w:Wd,h:100,t:'\u95E8\u63A7 Delta \u9012\u5F52\u6838',s:'g=exp(\u2212exp(A_log)\u00B7softplus(a+dt))',s2:'\u03B2=\u03C3(b) \u00B7 \u9010\u5934\u6807\u91CF',c:PAL.lin,d:'gdn'});
+  node({id:'gnorm',x:X,y:3743,w:Wd,h:46,t:'RMSNormGated(\u00D7silu(z))',c:PAL.lin,d:'gdn'});
+  node({id:'gout',x:X,y:3799,w:Wd,h:46,t:'out_proj 6144\u21925120',c:PAL.lin,d:'gdn'});
+  resNode('gad1',CX,3880,'gdn');
+  node({id:'gln2',x:X,y:3915,w:Wd,h:46,t:'RMSNorm',c:PAL.lin,d:'gdn'});
+  node({id:'gmlp',x:X,y:3981,w:Wd,h:62,t:'MLP \u524D\u9988\uFF08SwiGLU\uFF09',s:'5120\u219217408\u21925120 \u00B7 \u89C1\u53F3\u4FA7',c:PAL.mlp,d:'mlp'});
+  resNode('gad2',CX,4072,'gdn');
+  node({id:'goutc',x:X,y:4110,w:Wd,h:40,t:'h\u2032 [1,274,5120] \u2192 \u4E0B\u4E00\u5C42',c:PAL.lin,d:'gdn'});
+  var ys=[['gin','gln'],['gln','gqkv'],['gqkv','gzab'],['gzab','gconv'],['gconv','gspl'],['gspl','gcore'],['gcore','gnorm'],['gnorm','gout']];
+  ys.forEach(function(p){fpath('M'+CX+','+(NODES[p[0]].y+NODES[p[0]].h)+'V'+NODES[p[1]].y,'eflow')});
+  fpath('M'+CX+',3845V3860','eflow');fpath('M'+CX+',3900V3915','eflow');
+  fpath('M'+CX+',3961V3981','eflow');fpath('M'+CX+',4043V4052','eflow');fpath('M'+CX+',4092V4110','eflow');
+  fpath('M500,3220H478V3880H606','eres',true,'arrp');
+  fpath('M650,3880H775V4072H656','eres',true,'arrp');
+  fpath('M760,4130C905,4130 1105,4080 1105,3900L1105,3280C1105,3240 900,3220 764,3220','eloop');
+  chip(930,3260,'\u27F2 \u4F20\u7ED9\u4E0B\u4E00\u5C42',true,'decoder5');
+  chip(430,3540,'\u6B8B\u5DEE\u4FDD\u7559\u539F\u6837',false,'gdn');
+  node({id:'gcs',x:790,y:3483,w:270,h:64,t:'conv_state',s:'[1,3,10240] \u00B7 \u6ED1\u7A97\u5386\u53F2',c:PAL.neu,d:'gdn'});
+  fpath('M790,3505C770,3505 772,3500 762,3500','esup',true,'arrv');
+  fpath('M762,3520C772,3520 770,3525 788,3525','esup',true,'arrv');
+  node({id:'gsS',x:790,y:3633,w:270,h:110,t:'\u9012\u5F52\u72B6\u6001 S',s:'[1,48,128,128] fp32',s2:'\u56FA\u5B9A\u5927\u5C0F \u00B7 \u4E0E\u5E8F\u5217\u957F\u5EA6\u65E0\u5173',c:PAL.neu,d:'gdn'});
+  fpath('M790,3663C770,3663 772,3658 762,3658','esup',true,'arrv');
+  fpath('M762,3700C772,3700 770,3705 788,3705','esup',true,'arrv');
+  fpath('M1060,3670C1112,3670 1112,3730 1060,3730','eloop',true);
+  txt(975,3762,'\u6BCF token \u66F4\u65B0','note',gLabels);})();
+/* 4C 全局注意力层 */
+el('rect',{x:1120,y:3120,width:620,height:1080,rx:18,fill:'rgba(96,165,250,.05)',stroke:PAL.fa,'stroke-width':1.6},gBg);
+txt(1430,3162,'\u5168\u5C40\u6CE8\u610F\u529B\u5C42 \u00D716 \u00B7 GQA','sectitle',gBg,{fill:'#93c5fd','text-anchor':'middle'});
+txt(1430,3186,'\u4EE5\u7B2C 3 \u5C42\u771F\u5B9E\u6570\u636E\u4E3A\u4F8B \u00B7 L=274 \u00B7 24 \u95EE 4 \u7B54','secsub',gBg,{'text-anchor':'middle'});
+(function(){var X=1150,Wd=260,CX=1280;
+  node({id:'fin',x:X,y:3200,w:Wd,h:40,t:'x [1,274,5120]',c:PAL.fa,d:'fa'});
+  node({id:'fln',x:X,y:3265,w:Wd,h:46,t:'RMSNorm',c:PAL.fa,d:'fa'});
+  node({id:'fq',x:X,y:3329,w:Wd,h:54,t:'q_proj 5120\u219212288',s:'= q(24\u00D7256) \u2044 \u8F93\u51FA\u95E8(24\u00D7256)',c:PAL.fa,d:'fa'});
+  node({id:'fkv',x:X,y:3403,w:Wd,h:54,t:'k_proj / v_proj 5120\u21921024',s:'4 \u4E2A KV \u5934 \u00D7 256',c:PAL.fa,d:'fa'});
+  node({id:'fqn',x:X,y:3477,w:Wd,h:54,t:'QK-Norm',s:'\u9010\u5934 RMSNorm \u00B7 \u7A33\u5B9A\u6570\u503C',c:PAL.fa,d:'fa'});
+  node({id:'fmr',x:X,y:3551,w:Wd,h:54,t:'MRoPE \u65CB\u8F6C\uFF08\u524D 64 \u7EF4\uFF09',s:'\u5750\u6807\u5168\u573A\u53EA\u7B97 1 \u6B21 \u2192 16 \u5C42\u5171\u7528',c:PAL.fa,d:'fa'});
+  node({id:'fsd',x:X,y:3625,w:Wd,h:62,t:'SDPA \u56E0\u679C \u00B7 GQA 24:4',s:'scale 1/16 \u2192 [1,24,274,256]',c:PAL.fa,d:'fa'});
+  node({id:'fgt',x:X,y:3707,w:Wd,h:46,t:'\u00D7 \u03C3(\u8F93\u51FA\u95E8)',c:PAL.fa,d:'fa'});
+  node({id:'fo',x:X,y:3763,w:Wd,h:46,t:'o_proj 6144\u21925120',c:PAL.fa,d:'fa'});
+  resNode('fad1',CX,3880,'fa');
+  node({id:'fln2',x:X,y:3915,w:Wd,h:46,t:'RMSNorm',c:PAL.fa,d:'fa'});
+  node({id:'fmlp',x:X,y:3981,w:Wd,h:62,t:'MLP \u524D\u9988\uFF08SwiGLU\uFF09',s:'\u4E0E\u7EBF\u6027\u5C42\u5171\u7528\u540C\u4E00\u7ED3\u6784',c:PAL.mlp,d:'mlp'});
+  resNode('fad2',CX,4072,'fa');
+  node({id:'foutc',x:X,y:4110,w:Wd,h:40,t:'h\u2032 [1,274,5120] \u2192 \u4E0B\u4E00\u5C42',c:PAL.fa,d:'fa'});
+  var ys=[['fin','fln'],['fln','fq'],['fq','fkv'],['fkv','fqn'],['fqn','fmr'],['fmr','fsd'],['fsd','fgt'],['fgt','fo']];
+  ys.forEach(function(p){fpath('M'+CX+','+(NODES[p[0]].y+NODES[p[0]].h)+'V'+NODES[p[1]].y,'eflow')});
+  fpath('M'+CX+',3809V3860','eflow');fpath('M'+CX+',3900V3915','eflow');
+  fpath('M'+CX+',3961V3981','eflow');fpath('M'+CX+',4043V4052','eflow');fpath('M'+CX+',4092V4110','eflow');
+  fpath('M1150,3220H1136V3880H1256','eres',true,'arrp');
+  fpath('M1300,3880H1425V4072H1306','eres',true,'arrp');
+  fpath('M1410,4130C1600,4130 1755,4080 1755,3900L1755,3280C1755,3240 1560,3220 1414,3220','eloop');
+  chip(1580,3260,'\u27F2 \u4F20\u7ED9\u4E0B\u4E00\u5C42',true,'decoder5');
+  node({id:'kvc',x:1440,y:3560,w:270,h:110,t:'KVCache',s:'k,v [1,4,T,256] \u00B7 \u968F\u751F\u6210\u589E\u957F',s2:'prefill \u540E T=274',c:PAL.neu,d:'cache5'});
+  fpath('M1410,3430C1428,3430 1424,3540 1440,3575','esup',true,'arrv');
+  fpath('M1440,3650C1424,3650 1428,3656 1412,3656','esup',true,'arrv');
+  chip(1585,3340,'MRoPE \u5750\u6807\uFF08\u6765\u81EA \u2461 \uFF0C\u5168\u573A\u53EA\u7B97 1 \u6B21\uFF09',true,'mrope43');
+  fpath('M1496,3345C1420,3345 1418,3578 1412,3578','esup',true,'arrv');})();
+/* 4D 骨架与 MLP */
+el('rect',{x:1770,y:3120,width:520,height:1080,rx:18,fill:'rgba(244,114,182,.05)',stroke:PAL.mlp,'stroke-width':1.6},gBg);
+txt(2030,3162,'\u6BCF\u5C42\u5171\u7528\uFF1A\u5C42\u9AA8\u67B6\u4E0E MLP','sectitle',gBg,{fill:'#f9a8d4','text-anchor':'middle'});
+txt(2030,3186,'\u4E24\u79CD\u6CE8\u610F\u529B\u5C42\u90FD\u5957\u540C\u4E00\u4E2A\u5916\u58F3','secsub',gBg,{'text-anchor':'middle'});
+(function(){var X=1860,Wd=340,CX=2030;
+  node({id:'skh',x:X,y:3200,w:Wd,h:36,t:'h','c':PAL.neu,d:'decoder5'});
+  node({id:'skln',x:X,y:3256,w:Wd,h:40,t:'RMSNorm',c:PAL.neu,d:'decoder5'});
+  node({id:'skat',x:X,y:3316,w:Wd,h:54,t:'\u6CE8\u610F\u529B\uFF1A\u7EBF\u6027 \u6216 \u5168\u5C40\uFF08\u4E8C\u9009\u4E00\uFF0C\u89C1\u5DE6\u4FA7\uFF09',c:PAL.lin,d:'decoder5'});
+  resNode('skad1',CX,3420,'decoder5');
+  node({id:'skln2',x:X,y:3456,w:Wd,h:40,t:'RMSNorm',c:PAL.neu,d:'decoder5'});
+  node({id:'skml',x:X,y:3516,w:Wd,h:54,t:'MLP\uFF08\u4E0B\u65B9\u5C55\u5F00\uFF09',c:PAL.mlp,d:'mlp'});
+  resNode('skad2',CX,3620,'decoder5');
+  node({id:'skh2',x:X,y:3656,w:Wd,h:36,t:'h\u2032 \u2192 \u4E0B\u4E00\u5C42',c:PAL.neu,d:'decoder5'});
+  fpath('M'+CX+',3236V3256','eflow');fpath('M'+CX+',3296V3316','eflow');fpath('M'+CX+',3370V3400','eflow');
+  fpath('M'+CX+',3440V3456','eflow');fpath('M'+CX+',3496V3516','eflow');fpath('M'+CX+',3570V3600','eflow');fpath('M'+CX+',3640V3656','eflow');
+  fpath('M1860,3218C1812,3218 1812,3420 2008,3420','eres',true,'arrp');
+  fpath('M2050,3420H2245V3620H2056','eres',true,'arrp');
+  txt(2030,3730,'MLP \u5185\u90E8\uFF08\u00D764 \u5C42\u5171\u7528\uFF09','ltitle',gLabels,{'text-anchor':'middle','fill':'#f9a8d4'});
+  node({id:'min',x:X,y:3760,w:Wd,h:36,t:'[1,274,5120]',c:PAL.mlp,d:'mlp'});
+  node({id:'mgate',x:1810,y:3826,w:160,h:54,t:'gate_proj',s:'5120\u219217408',c:PAL.mlp,d:'mlp'});
+  node({id:'mup',x:1990,y:3826,w:160,h:54,t:'up_proj',s:'5120\u219217408',c:PAL.mlp,d:'mlp'});
+  node({id:'mact',x:X,y:3910,w:Wd,h:46,t:'SwiGLU\uFF1Asilu(gate) \u2299 up',c:PAL.mlp,d:'mlp'});
+  node({id:'mdn',x:X,y:3976,w:Wd,h:46,t:'down_proj 17408\u21925120',c:PAL.mlp,d:'mlp'});
+  node({id:'mout',x:X,y:4042,w:Wd,h:36,t:'[1,274,5120] \u2295 \u6B8B\u5DEE',c:PAL.mlp,d:'mlp'});
+   fpath('M1890,3796C1890,3812 1890,3812 1890,3826','eflow');
+   fpath('M2070,3796C2070,3812 2070,3812 2070,3826','eflow');
+  fpath('M1890,3880V3900C1890,3908 1950,3910 2000,3910','eflow');
+  fpath('M2070,3880V3900C2070,3908 2110,3910 2060,3910','eflow');
+  fpath('M'+CX+',3956V3976','eflow');fpath('M'+CX+',4022V4042','eflow');
+  chip(2030,3895,'(1,274,17408)');
+  txt(2030,4130,'\u6240\u6709\u6295\u5F71 4bit\u00B7g64 \u00B7 RMSNorm/Conv1d/ S \u72B6\u6001\u4FDD\u6301 bf16\u00B7fp32','note',gLabels,{'text-anchor':'middle'});})();
+txt(1570,1385,'\u2463 \u5C55\u5F00\u89C1\u4E0B\u65B9 \u2193','note',null,{'text-anchor':'middle'});
+</script>
+<script>
+/* ════════ ⑤ 输出与自回归 ════════ */
+section({x:40,y:4340,w:W-80,h:560,c:PAL.ok,
+  t:'\u2464 \u8F93\u51FA\u5934\u4E0E\u81EA\u56DE\u5F52\u751F\u6210\u5FAA\u73AF',
+  s:'\u9884\u6D4B\u4E0B\u4E00\u4E2A\u5B57 \u2192 \u63A5\u56DE\u5E8F\u5217\u5C3E \u2192 \u590D\u7528 64 \u5C42\u7F13\u5B58\u518D\u731C\u4E0B\u4E00\u4E2A\uFF0C\u76F4\u81F3\u8BF4\u5B8C'});
+fpath('M260,4286V4474');
+chip(260,4312,'\u7B2C 64 \u5C42\u8F93\u51FA h (1,274,5120)',true,'decoder5');
+node({id:'fn5',x:140,y:4480,w:240,h:90,t:'RMSNorm \u7EC8\u5C42',s:'[1,274,5120] \u5F62\u72B6\u4E0D\u53D8',c:PAL.ok,d:'head61'});
+node({id:'lh5',x:440,y:4480,w:320,h:90,t:'lm_head',s:'5120 \u2192 248,320 \u00B7 4bit',c:PAL.ok,d:'head61'});
+node({id:'lg5',x:820,y:4480,w:300,h:90,t:'logits [1,274,248320]',s:'\u6BCF\u4E2A\u4F4D\u7F6E\u5BF9\u5168\u8BCD\u8868\u6253\u5206',c:PAL.ok,d:'head61'});
+node({id:'am5',x:1180,y:4480,w:220,h:90,t:'\u672B\u4F4D argmax',s:'\u53EA\u770B\u7B2C 274 \u4E2A\u4F4D\u7F6E',c:PAL.ok,d:'gen62'});
+node({id:'tk5',x:1460,y:4480,w:300,h:90,t:'\u300C\u8FD9\u5F20\u300D id 112148',s:'\u672C\u6B21\u524D\u5411\u771F\u5B9E\u7ED3\u679C',c:PAL.ok,d:'gen62'});
+edge({f:'fn5',fs:'r',t:'lh5',ts:'l',label:'h (1,274,5120)',dy:-75});
+edge({f:'lh5',fs:'r',t:'lg5',ts:'l',label:'(1,274,248320)',key:true,dy:-75});
+edge({f:'lg5',fs:'r',t:'am5',ts:'l',label:'248,320 \u4E2A\u5206\u6570',dy:-75});
+edge({f:'am5',fs:'r',t:'tk5',ts:'l',label:'id 112148',dy:-75});
+fpath('M1760,4525C2210,4525 2305,4470 2305,4420L2305,4292','eredot','arrg');
+chip(2100,4362,'\u27F2 \u751F\u6210\u7684 token \u63A5\u56DE\u5E8F\u5217\u5C3E\uFF0C\u91CD\u65B0\u8FC7 64 \u5C42(\u4EC5\u7B97\u65B0\u589E)\uFF0C\u76F4\u81F3 <im_end>',true,'gen62');
+(function(){el('rect',{x:1800,y:4620,width:460,height:230,rx:14,fill:'#0c1424',stroke:PAL.ok,'stroke-width':1.4},gNodes);
+  txt(1825,4665,'\u7528\u6237\uFF1A[512\u00D7512 \u56FE\u7247] \u8BF7\u63CF\u8FF0\u8FD9\u5F20\u56FE\u7247','',gNodes,{fill:'#ffd98a','font-size':'13px','font-family':'var(--mono)'});
+  txt(1825,4705,'\u6A21\u578B\uFF1A\u8FD9\u5F20\u56FE\u7247\u5C55\u793A\u4E86\u4E00\u5EA7\u7EA2\u9876\u623F\u5B50\u2026','',gNodes,{fill:'#7ee2a8','font-size':'13px','font-family':'var(--mono)'});
+  txt(1825,4750,'\u00B7 \u6BCF\u6B65\u53EA\u7B97 1 \u4E2A\u65B0 token\uFF1A[1\u00D71\u00D75120]','note',gNodes);
+  txt(1825,4778,'\u00B7 \u590D\u7528 64 \u5C42\u7F13\u5B58\uFF08\u8D26\u672C / KV\uFF09','note',gNodes);
+  txt(1825,4806,'\u00B7 \u9996\u6B21 prefill \u6700\u8D35\uFF0C\u4E4B\u540E\u6BCF\u6B65\u90FD\u662F\u589E\u91CF','note',gNodes);})();
+
+/* ════════ 节点明细数据(全部真实追踪值) ════════ */
+var C={txt:'#fbbf24',vis:'#22d3ee',vio:'#a78bfa',lin:'#fb923c',fa:'#60a5fa',mlp:'#f472b6',ok:'#34d399'};
+var D={
+tok1:{c:C.txt,t:'\u5206\u8BCD\u5668',s:'Qwen3VLProcessor \u00B7 \u8BCD\u8868 248,320 \u6761',rows:[
+ ['\u300C\u8BF7\u63CF\u8FF0\u8FD9\u5F20\u56FE\u7247\u300D','\u2192 4 \u4E2A token\uFF1A\u8BF7(96220) \u63CF\u8FF0(99172) \u8FD9\u5F20(112148) \u56FE\u7247(97904)'],
+ ['\u5207\u5206\u89C4\u5219','\u6C49\u8BED\u6309 1~2 \u5B57\u5E38\u7528\u8BCD\u5757(BPE)'],['\u8F93\u5165\u5F20\u91CF','input_ids [1\u00D7274] int32'],
+ ['\u5BF9\u8BDD\u6A21\u677F','chat template \u81EA\u52A8\u8865\u5F00\u5934/\u7ED3\u5C3E\u7B26\u53F7\uFF0C\u4E5F\u8981\u5360 token']],n:'\u6A21\u578B\u5168\u7A0B\u53EA\u5904\u7406\u7F16\u53F7\uFF1B\u751F\u6210\u65F6\u518D\u7531\u5206\u8BCD\u5668\u7FFB\u8BD1\u56DE\u6C49\u5B57\u3002'},
+tokseq:{c:C.txt,t:'input_ids (1, 274) \u9010\u6BB5\u6784\u6210',s:'\u771F\u5B9E\u5206\u8BCD\u7ED3\u679C\uFF08\u9996\u5C3E token id \u5DF2\u6838\u5BF9\uFF09',rows:[
+ ['\u6BB5\u2460 \u5F00\u5934 \u00D74','248045(\u2039im_start\u203A) \u00B7 846(user) \u00B7 198(\u21B5) \u00B7 248053(\u2039vision_start\u203A)'],
+ ['\u6BB5\u2461 \u56FE\u50CF\u5360\u4F4D \u00D7256','image_pad(248056) \u91CD\u590D 256 \u6B21 = 32\u00D732\u00F7(2\u00D72)'],
+ ['\u6BB5\u2462 \u95EE\u9898 \u00D74','\u8BF7(96220) \u00B7 \u63CF\u8FF0(99172) \u00B7 \u8FD9\u5F20(112148) \u00B7 \u56FE\u7247(97904)'],
+ ['\u6BB5\u2463 \u7ED3\u5C3E \u00D710','\u2039vision_end\u203A(248054) \u00B7 \u2039im_end\u203A(248046) \u00B7 \u21B5(198) \u00B7 \u2039im_start\u203A(248045) \u00B7 assistant(74455) \u00B7 \u21B5(198) \u00B7 \u2039think\u203A(248068) \u00B7 \u21B5\u21B5(271) \u00B7 \u2039/think\u203A(248069) \u00B7 \u21B5\u21B5(271)'],
+ ['\u5408\u8BA1','4 + 256 + 4 + 10 = 274 tokens'],['\u9884\u6D4B\u4F4D','\u7B2C 274 \u4E2A\u4F4D\u7F6E(logits[0,-1])']],n:'256 \u4E2A image_pad \u7684\u5D4C\u5165\u7A0D\u540E\u88AB\u89C6\u89C9\u5854\u8F93\u51FA\u6574\u4F53\u66FF\u6362\u2014\u2014\u8FD9\u662F VLM\u300C\u56FE\u6587\u540C\u5E8F\u5217\u300D\u7684\u5173\u952E\u8BBE\u8BA1\u3002'},
+img2:{c:C.vis,t:'\u56FE\u50CF\u5904\u7406\u5668',s:'Qwen2VLImageProcessorFast \u00B7 patch 16 \u00B7 temporal 2',rows:[
+ ['\u8F93\u5165\u56FE\u7247','512 \u00D7 512 RGB'],['\u5207\u5757','16\u00D716 \u50CF\u7D20/\u8865\u4E01 \u2192 32\u00D732 = 1024 \u4E2A\u8865\u4E01'],
+ ['\u5E27\u590D\u5236','\u5355\u56FE\u590D\u5236\u4E3A 2 \u5E27(\u65F6\u95F4\u6838 k=2)\uFF0C\u8BA1\u6570\u4ECD\u6309 1 \u4E2A\u65F6\u95F4\u5757'],
+ ['\u6BCF\u8865\u4E01\u6570\u5B57','3 \u901A\u9053 \u00D7 2 \u5E27 \u00D7 16 \u00D7 16 = 1536 \u4E2A\uFF0C\u5F52\u4E00\u5316 mean=std=0.5'],
+ ['\u8F93\u51FA','pixel_values [1024 \u00D7 1536] float32(\u8FDB\u5854\u524D\u8F6C bf16)'],['\u7F51\u683C\u4FE1\u606F','image_grid_thw = [[1, 32, 32]]']],n:'1024 \u884C\u7684\u8868\u683C\u6BCF\u884C\u5C31\u662F\u4E00\u4E2A\u8865\u4E01\u7684\u5B8C\u6574\u989C\u8272\u63CF\u8FF0\u3002'},
+tower33:{c:C.vis,t:'\u89C6\u89C9\u7F16\u7801\u5668\u603B\u89C8\uFF08\u27F3 \u00D727\uFF09',s:'Qwen3-VL ViT \u00B7 0.92GB \u00B7 \u5168\u7A0B bf16 \u4E0D\u91CF\u5316',rows:[
+ ['\u5FAA\u73AF','for blk in blocks[0..26]\uFF1A\u540C\u4E00\u7ED3\u6784\u4E32\u884C\u6267\u884C 27 \u6B21'],
+ ['\u6BCF\u5C42\u7ED3\u6784','x \u2295 attn(LN\u2081(x)) \u2192 h\uFF1Bh \u2295 mlp(LN\u2082(h))'],
+ ['\u5F62\u72B6','(1024,1152) \u5165\uFF0C27 \u5C42\u540E\u4ECD\u662F (1024,1152)'],
+ ['\u53C2\u6570','\u22481524 \u4E07/\u5757 \u00D7 27 \u2248 4.12 \u4EBF'],['deepstack','\u672C\u6A21\u578B\u7981\u7528(deepstack_visual_indexes=[])']],
+ n:'27 \u6B21\u5FAA\u73AF\u9010\u5C42\u7CBE\u70BC\uFF1A\u4F4E\u5C42\u770B\u8FB9\u7F18\u7EB9\u7406\uFF0C\u9AD8\u5C42\u7EC4\u5408\u51FA\u300C\u5C4B\u9876\u300D\u300C\u592A\u9633\u300D\u8FD9\u7C7B\u8BED\u4E49\u6982\u5FF5\u3002'},
+conv31:{c:C.vis,t:'Conv3d \u8865\u4E01\u5D4C\u5165',s:'PatchEmbed \u00B7 Conv3d(3\u21921152, k=(2,16,16), stride \u540C)',rows:[
+ ['\u8F93\u5165','[1024, 1536] bf16 \u2192 reshape [1024, 2,16,16, 3]'],
+ ['\u5377\u79EF','\u4E00\u6B21\u5B8C\u6210\u65F6\u95F4\u5408\u5E76(k=2) \u4E0E\u7A7A\u95F4\u5207\u5757(k=16)'],
+ ['\u8F93\u51FA','[1024, 1,1,1, 1152] \u2192 \u5C55\u5E73 [1024, 1152] bf16'],['\u6743\u91CD','(1152,2,16,16,3) \u2248 177 \u4E07\u53C2\u6570\uFF0Cbf16 \u4E0D\u91CF\u5316']],n:'\u8F93\u51FA 1024 \u884C = \u6BCF\u4E2A\u8865\u4E01\u4E00\u884C 1152 \u7EF4\u7279\u5F81\u3002'},
+pos32:{c:C.vis,t:'pos_embed \u4F4D\u7F6E\u7F16\u7801',s:'\u53EF\u5B66\u4E60\u8868 + \u53CC\u7EBF\u6027\u63D2\u503C',rows:[
+ ['\u4F4D\u7F6E\u8868','nn.Embedding(2304, 1152) = 48\u00D748 \u6700\u5927\u7F51\u683C'],
+ ['\u63D2\u503C\u7D22\u5F15','[4, 1024] int32\uFF1A\u6BCF\u4E2A\u8865\u4E01\u53D6 4 \u4E2A\u90BB\u89D2'],['\u67E5\u8868','[4, 1024, 1152] bf16'],
+ ['\u52A0\u6743\u6C42\u548C','(1-dh)(1-dw)A + (1-dh)dw B + dh(1-dw) C + dh dw D \u2192 [1024,1152]\uFF0C\u4E0E Conv3d \u8F93\u51FA\u9010\u5143\u7D20\u76F8\u52A0'],
+ ['\u65F6\u95F4\u7EF4','\u6309 t \u590D\u5236']],n:'48\u00D748 \u662F\u6A21\u578B\u652F\u6301\u7684\u6700\u5927\u7F51\u683C\uFF1B\u5B9E\u9645 32\u00D732 \u7F51\u683C\u9760\u53CC\u7EBF\u6027\u63D2\u503C\u9002\u914D\u3002'},
+virope2:{c:C.vis,t:'2D-RoPE \u9891\u7387\u8868',s:'VisionRotaryEmbedding \u00B7 \u884C/\u5217\u5404 18 \u9891\u7387',rows:[
+ ['\u9891\u7387\u8868','rotary_pos_emb(32) \u2192 [32, 18] fp32\uFF0C\u03B8=10000'],
+ ['\u5C55\u5F00','\u5757\u7D22\u5F15\u00D7merge + \u5757\u5185\u7D22\u5F15 \u2192 1024 \u4E2A (row,col) \u5750\u6807'],
+ ['\u8F93\u51FA','[1024, 36]\uFF1Afreq[row] \u2225 freq[col]'],['\u4F5C\u7528\u4F4D\u7F6E','27 \u4E2A\u5757\u7684 q/k\uFF08\u6BCF\u5934 72 \u7EF4 = 36 \u9891\u7387\u00D72\uFF09\uFF0Crotate_half \u98CE\u683C']],n:'\u4E0E\u8BED\u8A00\u6A21\u578B MRoPE \u4E92\u76F8\u72EC\u7ACB\uFF0C\u5728 \u2461 \u6C47\u5408\u65F6\u624D\u7EDF\u4E00\u3002'},
+viblock:{c:C.vis,t:'\u5355\u4E2A ViT Block\uFF08\u5FAA\u73AF\u4F53\uFF09',s:'Qwen3VLMoEVisionBlock \u00B7 \u771F\u5B9E\u7EF4\u5EA6',rows:[
+ ['\u8F93\u5165/\u8F93\u51FA','(1024, 1152) bf16\uFF0C\u5F62\u72B6\u4E0D\u53D8'],
+ ['\u6CE8\u610F\u529B','LN \u2192 qkv(1152\u21923456) \u2192 16\u5934\u00D772 \u2192 2D-RoPE \u2192 SDPA(\u5355\u56FE\u5206\u6BB5\uFF0cscale\u22480.118) \u2192 proj \u2192 \u2295\u6B8B\u5DEE'],
+ ['\u524D\u9988','LN \u2192 fc1(1152\u21924304) \u2192 GELU(tanh) \u2192 fc2(4304\u21921152) \u2192 \u2295\u6B8B\u5DEE'],
+ ['\u6743\u91CD','qkv+proj \u2248 531 \u4E07\uFF1Bfc1+fc2 \u2248 992 \u4E07\uFF08\u6BCF\u5757\uFF09']],n:'\u591A\u56FE\u65F6\u6309 cu_seqlens \u5207\u6BB5\u5206\u522B SDPA\uFF0C\u56FE\u4E0E\u56FE\u4E4B\u95F4\u4E0D\u4E92\u76F8\u6CE8\u610F\u3002'},
+merge34:{c:C.vis,t:'PatchMerger \u7A7A\u95F4\u5408\u5E76',s:'2\u00D72 \u5408\u5E76 + \u6295\u5F71\u5230\u8BED\u8A00\u7EF4\u5EA6',rows:[
+ ['\u8F93\u5165','[1024, 1152] bf16\uFF0827 \u5C42\u5FAA\u73AF\u540E\uFF09'],
+ ['LayerNorm','\u9010\u8865\u4E01 [1024,1152]\uFF08\u5408\u5E76\u524D\u5F52\u4E00\u5316\uFF09'],
+ ['2\u00D72 \u5408\u5E76','32\u00D732 \u2192 16\u00D716\uFF0C\u5373 1024 \u2192 256 \u884C\uFF1B\u6BCF\u884C 1152\u00D74 = 4608'],
+ ['\u6295\u5F71','fc1(4608\u21924608)+GELU \u2192 fc2(4608\u21925120)'],
+ ['\u8F93\u51FA','[256, 5120] bf16 \u2014\u2014 256 \u4E2A\u89C6\u89C9 token'],['\u53C2\u6570','\u22484480 \u4E07\uFF08bf16\uFF09']],n:'\u7A7A\u95F4\u538B\u7F29 4\u00D7\uFF1A\u7EC6\u8282\u6362\u8BED\u4E49\u30025120 \u4E0E\u8BED\u8A00\u9690\u85CF\u7EF4\u4E00\u81F4\uFF0C\u89C6\u89C9 token \u4ECE\u6B64\u53EF\u4E0E\u6587\u5B57 token \u6DF7\u6392\u5728\u540C\u4E00\u5E8F\u5217\u3002'},
+visum:{c:C.vis,t:'\u89C6\u89C9\u5854\u89C4\u683C\u5361',s:'\u5168\u90E8\u771F\u5B9E\u6570\u636E',rows:[
+ ['\u5C42\u6570','27\uFF08depth=27\uFF09'],['\u9690\u85CF\u7EF4','1152\uFF0C16 \u5934 \u00D7 72 \u7EF4'],['\u4E2D\u95F4\u7EF4','4304\uFF08\u22483.73\u00D7\uFF09'],
+ ['\u4F4D\u7F6E\u8868','2304 = 48\u00D748\uFF0C\u53CC\u7EBF\u6027\u63D2\u503C'],['\u8865\u4E01','16\u00D716\uFF0C\u65F6\u95F4\u6838 2'],
+ ['\u5408\u5E76','2\u00D72 \u2192 256 token \u00D7 5120'],['\u5185\u5B58','0.92GB\uFF08bf16\uFF0C\u4E0D\u91CF\u5316\uFF09'],
+ ['\u603B\u53C2\u6570','\u22484.6 \u4EBF']],n:'\u89C6\u89C9\u5854\u4E0D\u91CF\u5316\u662F\u4E3A\u4E86\u4FDD\u7559\u89C6\u89C9\u7CBE\u5EA6\uFF1B\u8BED\u8A00\u6A21\u578B\u624D\u505A 4bit\u3002'},
+embed41:{c:C.vio,t:'\u8BCD\u5D4C\u5165 embed_tokens',s:'QuantizedEmbedding(248320\u00D75120, 4bit\u00B7g64)',rows:[
+ ['\u8F93\u5165','input_ids [1\u00D7274]'],['\u67E5\u8868','\u6BCF\u4E2A\u7F16\u53F7\u53D6\u51FA 5120 \u7EF4\u5411\u91CF'],
+ ['\u8F93\u51FA','[1 \u00D7 274 \u00D7 5120] bf16'],['\u91CF\u5316\u5B58\u50A8','uint32 \u6253\u5305 [248320,640] + scales/biases bf16 [248320,80]'],
+ ['\u53C2\u6570','\u224812.71 \u4EBF\uFF08\u903B\u8F91\uFF09\u2248 0.64GB\uFF084bit\uFF09'],['\u7ED1\u5B9A','tie_word_embeddings=False\uFF08lm_head \u72EC\u7ACB\uFF09']],n:'256 \u4E2A\u56FE\u50CF\u5360\u4F4D token \u6B64\u523B\u67E5\u5230\u7684\u5411\u91CF\u53EA\u662F\u8349\u7A3F\uFF0C\u4E0B\u4E00\u6B65\u88AB\u89C6\u89C9\u7279\u5F81\u6574\u4F53\u8986\u76D6\u3002'},
+scatter42:{c:C.vio,t:'\u56FE\u6587\u6C47\u5408 masked_scatter',s:'qwen3_5.py: merge_input_ids_with_image_features',rows:[
+ ['\u6587\u5B57\u5411\u91CF','[1,274,5120]\uFF08274 \u884C\u8349\u7A3F\uFF09'],['\u89C6\u89C9\u7279\u5F81','[256,5120]\uFF08\u2462 \u7684\u4EA7\u7269\uFF09'],
+ ['\u63A9\u7801','input_ids == 248056(image_pad) \u6216 248057(video_pad) \u2192 256 \u4E2A\u4F4D\u7F6E'],
+ ['\u64CD\u4F5C','\u63A9\u7801\u4F4D\u7F6E\u66FF\u6362\u4E3A\u89C6\u89C9\u7279\u5F81\uFF0C\u5176\u4F59 18 \u884C\u6587\u5B57\u5411\u91CF\u4E0D\u52A8'],
+ ['\u6821\u9A8C','\u63A9\u7801\u5143\u7D20\u6570 256\u00D75120 \u5FC5\u987B\u4E0E\u89C6\u89C9\u7279\u5F81\u5143\u7D20\u6570\u5B8C\u5168\u76F8\u7B49\uFF0C\u5426\u5219\u62A5\u9519'],
+ ['\u8F93\u51FA','inputs_embeds [1 \u00D7 274 \u00D7 5120] bf16']],n:'\u8FD9\u4E00\u6B65\u4E4B\u540E\uFF0C\u6A21\u578B\u773C\u4E2D\u53EA\u6709\u4E00\u6761\u7EDF\u4E00\u7684 274-token \u5E8F\u5217\uFF1A4 \u5F00\u5934 + 256 \u56FE\u50CF + 4 \u95EE\u9898 + 10 \u7ED3\u5C3E\u3002'},
+mrope43:{c:C.vio,t:'MRoPE \u4F4D\u7F6E\u5750\u6807\uFF08\u5168\u573A\u53EA\u7B97 1 \u6B21\uFF09',s:'get_rope_index + Qwen3_5RotaryEmbedding(interleaved)',rows:[
+ ['\u8F93\u51FA','position_ids [3 \u00D7 1 \u00D7 274]\uFF08t/h/w \u4E09\u8F74\uFF09'],['rope_deltas','[1,1]\uFF0C\u751F\u6210\u9636\u6BB5\u7528\u6765\u5EF6\u7EED\u5750\u6807'],
+ ['\u56FE\u50CF\u6BB5\uFF08256 \u4E2A\uFF09','t=0 \u00B7 h=\u884C\u53F7 0~15 \u00B7 w=\u5217\u53F7 0~15\uFF0816\u00D716 \u5408\u5E76\u540E\u7F51\u683C\uFF09'],
+ ['\u6587\u5B57\u6BB5\uFF0818 \u4E2A\uFF09','t = h = w = \u9012\u589E\u5E8F\u53F7'],
+ ['\u65CB\u8F6C\u7EF4','64 = 256 \u00D7 0.25\uFF08\u6BCF\u5934\u4EC5\u524D 64 \u7EF4\u53C2\u4E0E\u65CB\u8F6C\uFF09'],
+ ['\u9891\u7387\u5206\u914D','32 \u9891\u7387\u6309 t/h/w \u4EA4\u9514\uFF1amrope_section [11,11,10]\uFF0C\u03B8=1e7'],
+ ['\u4F7F\u7528\u65B9','\u4EC5 16 \u4E2A\u5168\u5C40\u6CE8\u610F\u529B\u5C42\uFF08\u6BCF\u5C42\u65CB\u8F6C\u5404\u81EA\u7684 q/k\uFF0C\u5750\u6807\u4E0D\u91CD\u7B97\uFF09\uFF1B48 \u4E2A\u7EBF\u6027\u5C42\u4E0D\u7528\u5750\u6807\uFF0C\u9760\u9012\u5F52\u72B6\u6001\u8BB0\u5FC6\u987A\u5E8F']],
+ n:'\u4EA4\u9514\u5F0F MRoPE \u662F Qwen3.8 \u76F8\u5BF9\u8001\u7248\u7684\u53D8\u5316\uFF1A\u9891\u7387\u5728\u4E09\u8F74\u95F4\u6309\u4F4D\u7F6E\u53D6\u6A21\u4EA4\u9514\u5206\u914D\uFF080,3,6\u2026\u2192t\uFF1B1,4,7\u2026\u2192h\uFF1B2,5,8\u2026\u2192w\uFF09\uFF0C\u6BD4\u5206\u6BB5\u62FC\u63A5\u66F4\u5747\u5300\u3002'},
+decoder5:{c:C.lin,t:'64 \u5C42\u7684\u7F16\u6392\u89C4\u5219',s:'Qwen3_5DecoderLayer \u00D7 64 \u00B7 full_attention_interval=4',rows:[
+ ['\u5224\u5B9A\u89C4\u5219','is_linear = (\u5C42\u53F7+1) % 4 \u2260 0'],
+ ['\u7EBF\u6027\u5C42','\u7B2C 0,1,2 / 4,5,6 / \u2026 / 60,61,62 \u5C42\uFF0C\u5171 48 \u4E2A'],
+ ['\u5168\u5C40\u5C42','\u7B2C 3,7,11,\u2026,63 \u5C42\uFF0C\u5171 16 \u4E2A'],
+ ['\u5171\u6027','\u6BCF\u5C42\uFF1A\u5F52\u4E00\u5316 \u2192 \u6CE8\u610F\u529B \u2192 \u2295 \u2192 \u5F52\u4E00\u5316 \u2192 MLP \u2192 \u2295'],
+ ['\u4F20\u9012','h [1,274,5120] \u9010\u5C42\u6539\u5199\uFF0C\u5F62\u72B6\u4E0D\u53D8'],
+ ['\u4F4D\u7F6E\u5750\u6807','\u2461 \u7B97\u597D\u7684 [3,1,274] \u4E00\u4EFD\uFF0C16 \u4E2A\u5168\u5C40\u5C42\u5171\u7528']],n:'3:1 \u7684\u6DF7\u5408\u6BD4\u4F8B\u662F\u957F\u4E0A\u4E0B\u6587\u4E0E\u7CBE\u5EA6\u7684\u6298\u4E2D\uFF1A75% \u7684\u5C42\u7528 O(T) \u7EBF\u6027\u6CE8\u610F\u529B\u625B\u957F\u5EA6\uFF0C25% \u7684\u5C42\u7528\u7CBE\u786E\u6CE8\u610F\u529B\u4FDD\u68C0\u7D22\uFF08\u652F\u6301 262,144 token\uFF09\u3002'},
+gdn:{c:C.lin,t:'\u7EBF\u6027\u6CE8\u610F\u529B\u5C42\u5185\u90E8\uFF08\u00D748\uFF09',s:'Qwen3_5GatedDeltaNet \u00B7 \u7B2C 0 \u5C42\u771F\u5B9E\u6570\u636E\uFF08L=274\uFF09',rows:[
+ ['\u2460 RMSNorm','[1,274,5120] \u2192 \u540C\u5F62'],
+ ['\u2461 in_proj_qkv(4bit)','5120\u219210240 \u2192 [1,274,10240] = q 2048 + k 2048 + v 6144'],
+ ['\u2462 in_proj_z(4bit)','5120\u21926144 \u2192 [1,274,6144]\uFF08\u8F93\u51FA\u95E8\uFF09'],
+ ['\u2463 in_proj_a / b(4bit)','5120\u219248 \u2192 [1,274,48]\u00D72\uFF08\u8870\u51CF a\u3001\u5199\u5165\u95E8 b\uFF0C\u6BCF\u5934\u4E00\u4E2A\u6570\uFF09'],
+ ['\u2464 \u56E0\u679C\u5377\u79EF','\u62FC\u63A5 conv_state [1,3,10240] \u2192 [1,277,10240] \u2192 Conv1d(k=4, 10240 \u7EC4) \u2192 [1,274,10240] \u2192 SiLU'],
+ ['\u2465 \u62C6\u5934','q,k \u2192 [1,274,16,128]\uFF1Bv \u2192 [1,274,48,128]\uFF1Bq/k \u505A L2 \u5F52\u4E00\u5316\uFF08\u5E26 1/\u221Ad \u7F29\u653E\uFF09'],
+ ['\u2466 \u95E8\u63A7','g = exp(\u2212exp(A_log)\u00B7softplus(a+dt_bias))\uFF0C\u03B2 = \u03C3(b)\uFF0C\u5747 [1,274,48]'],
+ ['\u2467 Delta \u9012\u5F52','\u72B6\u6001 S [1,48,128,128] fp32\uFF1Bprefill \u8D70\u5206\u5757\u5E76\u884C\u626B\u63CF\uFF08\u5757\u957F 64\uFF09\u6216 Metal \u878D\u5408\u6838\uFF1B\u8F93\u51FA [1,274,48,128]'],
+ ['\u2468 \u95E8\u63A7 RMSNorm','rms_norm(Y)\u00B7silu(z) \u2192 [1,274,48,128]'],
+ ['\u2469 out_proj(4bit)','6144\u21925120 \u2192 [1,274,5120] \u2192 \u2295\u6B8B\u5DEE'],
+ ['\u6743\u91CD/\u5C42','\u22481.16 \u4EBF\uFF08conv1d\u3001A_log\u3001dt_bias \u4E3A bf16\uFF0C\u5176\u4F59 4bit\uFF09']],
+ f:'S_t = \u03B3_t \u00B7 S_{t\u22121} \u00B7 (I \u2212 \u03B2_t\u00B7k_t k_t\u1D40) + \u03B2_t\u00B7v_t k_t\u1D40\ny_t = q_t\u1D40 S_t',
+ n:'\u8D26\u672C\u5927\u5C0F\u56FA\u5B9A\uFF0848\u00D7128\u00D7128\uFF09\uFF0C\u4E0E\u5E8F\u5217\u957F\u5EA6\u65E0\u5173\u2014\u2014\u8FD9\u662F\u5B83\u4E0D\u5EFA KV \u7F13\u5B58\u3001\u80FD\u625B\u8D85\u957F\u4E0A\u4E0B\u6587\u7684\u6839\u672C\u539F\u56E0\u3002'},
+fa:{c:C.fa,t:'\u5168\u5C40\u6CE8\u610F\u529B\u5C42\u5185\u90E8\uFF08\u00D716\uFF09',s:'Qwen3_5Attention \u00B7 \u7B2C 3 \u5C42\u771F\u5B9E\u6570\u636E\uFF08L=274\uFF09',rows:[
+ ['\u2460 RMSNorm','[1,274,5120] \u2192 \u540C\u5F62'],
+ ['\u2461 q_proj(4bit)','5120\u219212288 \u2192 [1,274,12288] = q 6144 \u2044 \u8F93\u51FA\u95E8 gate 6144\uFF08\u7EF4\u5EA6\u52A0\u500D\u7684\u539F\u56E0\uFF09'],
+ ['\u2462 k/v_proj(4bit)','5120\u21921024 \u2192 \u5404 [1,274,4,256]\uFF084 \u4E2A KV \u5934\uFF09'],
+ ['\u2463 QK-Norm','q [1,274,24,256] \u00B7 k [1,274,4,256] \u9010\u5934 RMSNorm'],
+ ['\u2464 MRoPE','\u7528 \u2461 \u7684\u5750\u6807 [3,1,274] \u65CB\u8F6C q [1,24,274,256] / k [1,4,274,256] \u7684\u524D 64 \u7EF4'],
+ ['\u2465 KV \u7F13\u5B58','update_and_fetch \u2192 k,v [1,4,274,256]\uFF08\u968F\u540E\u7EED\u751F\u6210\u589E\u957F\uFF09'],
+ ['\u2466 SDPA','q [1,24,274,256] \u00D7 k/v [1,4,274,256]\uFF0C\u56E0\u679C\u63A9\u7801\uFF0cscale=1/16\uFF0CGQA 24:4=6:1 \u2192 [1,24,274,256]'],
+ ['\u2467 \u8F93\u51FA\u95E8\u63A7 + o_proj','reshape [1,274,6144] \u00D7 \u03C3(gate) \u2192 o_proj(4bit) 6144\u21925120 \u2192 \u2295\u6B8B\u5DEE'],
+ ['\u6743\u91CD/\u5C42','\u22481.05 \u4EBF\uFF08\u5168\u90E8 4bit\uFF09']],
+ f:'attn(x) = o_proj( SDPA(q,k,v) \u00B7 \u03C3(gate) )',
+ n:'\u300C24 \u4E2A\u63D0\u95EE\u5934\u5171\u4EAB 4 \u7EC4 KV\u300D\u5373 GQA\uFF0CKV \u7F13\u5B58\u76F4\u63A5\u7701\u5230 1/6\uFF1Bq_proj \u8F93\u51FA\u7FFB\u500D\u662F\u4E3A\u4E86\u9644\u5E26\u9010\u7EF4\u8F93\u51FA\u95E8\uFF08attn_output_gate\uFF09\u3002'},
+mlp:{c:C.mlp,t:'\u524D\u9988 MLP\uFF08\u6BCF\u5C42 1 \u4E2A\uFF0C\u5171 \u00D764\uFF09',s:'Qwen3_5MLP \u00B7 SwiGLU \u00B7 \u4E24\u79CD\u6CE8\u610F\u529B\u5C42\u5171\u7528',rows:[
+ ['\u8F93\u5165','[1,274,5120]\uFF08post_attention_layernorm \u4E4B\u540E\uFF09'],
+ ['gate_proj / up_proj(4bit)','5120\u219217408 \u2192 [1,274,17408] \u00D72'],
+ ['\u6FC0\u6D3B','swiglu = silu(gate) \u2299 up'],
+ ['down_proj(4bit)','17408\u21925120 \u2192 [1,274,5120] \u2192 \u2295\u6B8B\u5DEE'],
+ ['\u53C2\u6570/\u5C42','\u22482.67 \u4EBF\uFF1B64 \u5C42\u5408\u8BA1 \u2248171 \u4EBF\uFF0C\u7EA6\u5360\u8BED\u8A00\u6A21\u578B 64%'],['\u4E2D\u95F4\u7EF4','17408 = 5120 \u00D7 3.4']],n:'MLP \u662F\u53C2\u6570\u91CF\u6700\u5927\u7684\u90E8\u4EF6\uFF1B\u6240\u6709\u6295\u5F71 4bit \u91CF\u5316\uFF0CRMSNorm \u4FDD\u6301 bf16\u3002'},
+cache5:{c:C.lin,t:'\u6BCF\u5C42\u72B6\u6001\u7F13\u5B58',s:'make_cache() \u00B7 \u751F\u6210\u65F6\u9010\u5C42\u590D\u7528',rows:[
+ ['\u7EBF\u6027\u5C42 \u00D748','ArraysCache(2) = [conv_state, ssm_state]'],
+ ['conv_state','[1,3,10240] \u00B7 \u5377\u79EF\u6ED1\u7A97\u5386\u53F2\uFF08\u6700\u8FD1 3 \u6B65\uFF09'],
+ ['ssm_state','[1,48,128,128] fp32 \u00B7 \u9012\u5F52\u8D26\u672C'],
+ ['\u5168\u5C40\u5C42 \u00D716','KVCache\uFF1Ak [1,4,T,256] + v [1,4,T,256]\u00B7 prefill \u540E T=274'],
+ ['decode \u6BCF\u6B65','\u7EBF\u6027\u5C42\uFF1A\u8D26\u672C\u9012\u5F52\u4E00\u6B65\uFF1B\u5168\u5C40\u5C42\uFF1AKV \u8FFD\u52A0 1 \u5217']],n:'\u7F13\u5B58\u5927\u5C0F\u51B3\u5B9A\u4E86\u751F\u6210\u9636\u6BB5\u7684\u5185\u5B58\u5F00\u9500\uFF1A\u7EBF\u6027\u5C42\u56FA\u5B9A\u4E0D\u53D8\uFF0C\u5168\u5C40\u5C42\u968F\u5E8F\u5217\u7EBF\u6027\u589E\u957F\u3002'},
+mixnote:{c:C.lin,t:'\u4E3A\u4EC0\u4E48 3:1 \u6DF7\u5408\uFF1F',s:'\u8BBE\u8BA1\u52A8\u673A\uFF08\u957F\u4E0A\u4E0B\u6587 vs \u7CBE\u786E\u68C0\u7D22\uFF09',rows:[
+ ['\u7EBF\u6027\u6CE8\u610F\u529B 75%','O(T) \u590D\u6742\u5EA6\uFF1B\u56FA\u5B9A\u8D26\u672C\u987A\u5E8F\u7FFB\u9605\uFF0C\u4E0D\u5B58\u5B8C\u6574\u5386\u53F2\uFF0C\u625B 26 \u4E07 token \u4E0A\u4E0B\u6587'],
+ ['\u5168\u5C40\u6CE8\u610F\u529B 25%','O(T\u00B2) \u4F46\u7CBE\u786E\uFF1B\u56DE\u5934\u7CBE\u8BFB\u5168\u90E8 token\uFF0C\u5173\u952E\u4FE1\u606F\u4E0D\u4E22'],
+ ['\u4EA4\u66FF\u7F16\u6392','\u6BCF 3 \u5C42\u5FEB\u901F\u5C42\u63A5 1 \u5C42\u7CBE\u8BFB\u5C42\uFF0C\u517C\u987E\u201C\u957F\u201D\u4E0E\u201C\u51C6\u201D']],n:'\u8FD9\u662F Qwen3-Next \u4EE5\u6765\u6DF7\u5408\u67B6\u6784\u7684\u5171\u540C\u601D\u8DEF\uFF0C\u672C\u6A21\u578B\u5C06\u5176\u5E94\u7528\u4E8E\u591A\u6A21\u6001\u573A\u666F\u3002'},
+head61:{c:C.ok,t:'\u6253\u5206\u5934 lm_head',s:'QuantizedLinear(5120\u2192248320, 4bit\u00B7g64\u00B7affine)',rows:[
+ ['\u8F93\u5165','[1,274,5120]\uFF0864 \u5C42 + \u6700\u7EC8 RMSNorm \u4E4B\u540E\uFF09'],
+ ['\u8F93\u51FA','logits [1 \u00D7 274 \u00D7 248320] bf16'],['\u542B\u4E49','\u6BCF\u4E2A\u4F4D\u7F6E\u5BF9\u5B57\u5178 248,320 \u4E2A\u8BCD\u5404\u6253\u4E00\u5206'],
+ ['\u6743\u91CD','\u224812.71 \u4EBF\uFF08\u903B\u8F91\uFF09\u2248 0.64GB\uFF084bit\uFF09\uFF1B\u4E0E embed_tokens \u4E0D\u5171\u4EAB'],
+ ['\u52A0\u901F','\u652F\u6301\u91CF\u5316\u6838\u5185 argmax(fused_greedy_decode)\uFF0C\u514D\u7269\u5316\u5168\u8BCD\u8868 logits']],n:'\u53EA\u53D6\u6700\u540E\u4E00\u4E2A\u4F4D\u7F6E\uFF1A\u8BED\u8A00\u6A21\u578B\u7684\u4EFB\u52A1\u5C31\u662F\u201C\u63A5\u7740\u5199\u201D\u3002'},
+gen62:{c:C.ok,t:'\u81EA\u56DE\u5F52\u751F\u6210\u5FAA\u73AF',s:'\u4E00\u6B21\u731C\u4E00\u4E2A\u5B57 \u00B7 \u7F13\u5B58\u5168\u90E8\u590D\u7528',rows:[
+ ['\u6B65\u9AA4\u2460','\u53D6 argmax \u5F97\u300C\u8FD9\u5F20\u300D\uFF08id 112148\uFF09\uFF0C\u63A5\u5230\u5E8F\u5217\u672B\uFF1A274 \u2192 275'],
+ ['\u6B65\u9AA4\u2461','\u5E8F\u5217\u518D\u8FC7 64 \u5C42\u6D41\u6C34\u7EBF\uFF0C\u4F46\u53EA\u9700\u8BA1\u7B97 1 \u4E2A\u65B0 token\uFF08S=1\uFF09'],
+ ['\u590D\u7528','\u7EBF\u6027\u5C42\uFF1A\u8D26\u672C S \u9012\u5F52\u4E00\u6B65\uFF1B\u5168\u5C40\u5C42\uFF1AKV \u7F13\u5B58\u8FFD\u52A0 1 \u5217\uFF1B\u5377\u79EF\uFF1A\u5FEB\u901F\u5355\u6B65\u8DEF\u5F84'],
+ ['\u7EC8\u6B62','\u751F\u6210\u7ED3\u675F\u7B26 \u2039im_end\u203A(248046) \u6216\u8FBE\u957F\u5EA6\u4E0A\u9650'],
+ ['\u4EE3\u4EF7','\u9996\u5B57\uFF08\u672C\u6B21 274 token\uFF09\u6700\u8D35\uFF1B\u4E4B\u540E\u6BCF\u5B57\u53EA\u7B97 1 \u4E2A token \u7684\u589E\u91CF']],n:'\u6240\u6709\u7EF4\u5EA6\u4E0E\u300C\u8FD9\u5F20\u300D\u5747\u4E3A\u672C\u6B21\u771F\u5B9E\u524D\u5411\u7684\u8BB0\u5F55\uFF1B\u751F\u6210\u671F\u6BCF\u6B65\u8F93\u5165\u5F62\u72B6\u90FD\u662F [1\u00D71\u00D75120]\u3002'}
+};
+</script>
+<script>
+/* ════════ 明细面板 ════════ */
+var panel=document.getElementById('panel');
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+function openPanel(key){
+  var d=D[key];if(!d)return;
+  document.getElementById('ptitle').textContent=d.t;
+  document.getElementById('psub').textContent=d.s;
+  panel.style.borderLeft='3px solid '+d.c;
+  var h='';
+  if(d.rows){h+='<table class="mtable"><tr><th>\u73AF\u8282</th><th>\u7EF4\u5EA6 / \u8BF4\u660E\uFF08\u771F\u5B9E\u8FFD\u8E2A\u503C\uFF09</th></tr>';
+    d.rows.forEach(function(r){h+='<tr><td class="k">'+esc(r[0])+'</td><td class="v">'+esc(r[1])+'</td></tr>'});h+='</table>'}
+  if(d.f)h+='<div class="mformula" style="border-left-color:'+d.c+'">'+esc(d.f)+'</div>';
+  if(d.n)h+='<div class="mnote">'+esc(d.n)+'</div>';
+  document.getElementById('pbody').innerHTML=h;
+  panel.classList.add('open');
+}
+document.getElementById('pclose').onclick=function(){panel.classList.remove('open')};
+document.addEventListener('keydown',function(e){if(e.key==='Escape')panel.classList.remove('open')});
+
+/* ════════ 视图:缩放 / 平移 / 跳转 / 标注开关 ════════ */
+var view={x:0,y:0,w:W,h:H};
+function applyView(){svg.setAttribute('viewBox',view.x+' '+view.y+' '+view.w+' '+view.h)}
+applyView();
+var stage=document.getElementById('stage');
+stage.addEventListener('wheel',function(e){
+  e.preventDefault();
+  var r=svg.getBoundingClientRect();
+  var mx=view.x+(e.clientX-r.left)/r.width*view.w;
+  var my=view.y+(e.clientY-r.top)/r.height*view.h;
+  var k=e.deltaY>0?1.12:0.89;
+  var nw=Math.max(360,Math.min(W*1.6,view.w*k));k=nw/view.w;
+  view.x=mx-(mx-view.x)*k;view.y=my-(my-view.y)*k;view.w*=k;view.h*=k;
+  applyView();
+},{passive:false});
+var panning=false,lastX=0,lastY=0,moved=0;
+stage.addEventListener('pointerdown',function(e){panning=true;moved=0;lastX=e.clientX;lastY=e.clientY;stage.classList.add('drag')});
+window.addEventListener('pointermove',function(e){
+  if(!panning)return;
+  var r=svg.getBoundingClientRect();
+  view.x-=(e.clientX-lastX)*view.w/r.width;
+  view.y-=(e.clientY-lastY)*view.h/r.height;
+  moved+=Math.abs(e.clientX-lastX)+Math.abs(e.clientY-lastY);
+  if(moved>5)dragged=true;
+  lastX=e.clientX;lastY=e.clientY;applyView();
+});
+window.addEventListener('pointerup',function(){panning=false;stage.classList.remove('drag');setTimeout(function(){dragged=false},60)});
+document.getElementById('resetView').onclick=function(){view={x:0,y:0,w:W,h:H};applyView()};
+document.querySelectorAll('[data-jump]').forEach(function(b){
+  b.onclick=function(){var s=SECS[+b.getAttribute('data-jump')];view={x:0,y:s.y-40,w:W,h:s.h+80};applyView()};});
+document.getElementById('dimToggle').onclick=function(){
+  document.body.classList.toggle('showdims');
+  this.classList.toggle('on');
+  this.textContent=document.body.classList.contains('showdims')?'\u9690\u85CF\u7EF4\u5EA6\u6807\u6CE8':'\u663E\u793A\u5168\u90E8\u7EF4\u5EA6\u6807\u6CE8';};
+</script>
+<script>
+/* 画布底色(独立导出时保留深色背景) */
+(function(){
+  var defs=svg.querySelector('defs');
+  var rg=el('radialGradient',{id:'bgg',cx:'50%',cy:'0%',r:'85%'},defs);
+  el('stop',{offset:'0%','stop-color':'#16213c'},rg);
+  el('stop',{offset:'55%','stop-color':'#0a0e1a'},rg);
+  var bg=el('rect',{x:0,y:0,width:W,height:H,fill:'url(#bgg)'});
+  svg.insertBefore(bg,svg.firstChild);
+})();
+/* 底部图例带 */
+(function(){var y0=4990;
+  el('rect',{x:40,y:4972,width:W-80,height:88,rx:14,fill:'rgba(15,22,38,.72)',stroke:'#233252','stroke-width':1},gBg);
+  var items=[[PAL.txt,'\u6587\u5B57/\u5206\u8BCD'],[PAL.vis,'\u89C6\u89C9\u7F16\u7801'],[PAL.vio,'\u7EC4\u88C5/\u4F4D\u7F6E'],[PAL.lin,'\u7EBF\u6027\u6CE8\u610F\u529B\u00D748'],[PAL.fa,'\u5168\u5C40\u6CE8\u610F\u529B\u00D716'],[PAL.mlp,'MLP\u00D764'],[PAL.ok,'\u8F93\u51FA']];
+  var x=86;
+  items.forEach(function(it){el('rect',{x:x,y:y0,width:15,height:15,rx:4,fill:it[0]},gLabels);
+    txt(x+23,y0+13,it[1],'note',gLabels,{'fill':'#c9d7f2','font-size':'13px'});x+=it[1].length*13+58;});
+  var lx=86,ly=y0+44;
+  var lines=[['#56688f',false,'\u6570\u636E\u6D41'],['#f472b6',false,'\u6B8B\u5DEE'],['#a78bfa',true,'\u5750\u6807/\u72B6\u6001\u4F9B\u7ED9'],['#8fa0c2',true,'\u5FAA\u73AF'],['#34d399',true,'\u81EA\u56DE\u5F52\u751F\u6210']];
+  lines.forEach(function(l){var pa=el('path',{d:'M'+lx+','+ly+'h58',stroke:l[0],'stroke-width':2.2,fill:'none'},gLabels);
+    if(l[1])pa.setAttribute('stroke-dasharray','7 5');
+    txt(lx+68,ly+4,l[2],'note',gLabels,{'fill':'#c9d7f2','font-size':'13px'});lx+=l[2].length*13+98;});
+  txt(W-60,4985,'\u70B9\u51FB\u8282\u70B9\u770B\u7EF4\u5EA6\u660E\u7EC6(\u4EA4\u4E92\u7248)','note',gLabels,{'fill':'#5c6b8c','text-anchor':'end','font-size':'12px'});
+})();
+</script>
+<script>
+window.addEventListener('load',function(){
+  try{
+    var out={nodes:[],paths:[],chips:CHIPS||[]};
+    for(var id in NODES){var n=NODES[id];if(n.w>2)out.nodes.push({id:id,x:n.x,y:n.y,w:n.w,h:n.h});}
+    var ps=svg.querySelectorAll('path');
+    for(var i=0;i<ps.length;i++){var p=ps[i];var d=p.getAttribute('d');if(!d)continue;
+      var L=p.getTotalLength();if(!L)continue;var pts=[];var N=Math.max(6,Math.min(360,Math.ceil(L/5)));
+      for(var k=0;k<=N;k++){var pt=p.getPointAtLength(L*k/N);pts.push([+pt.x.toFixed(1),+pt.y.toFixed(1)]);}
+      out.paths.push({i:i,cls:p.getAttribute('class')||'',d:d.slice(0,60),pts:pts});}
+    var texts=[];var ts=svg.querySelectorAll('text');
+    for(var q=0;q<ts.length;q++){var t=ts[q];var bb=t.getBBox();
+      texts.push({cls:t.getAttribute('class')||'',s:(t.textContent||'').slice(0,24),x:+bb.x.toFixed(1),y:+bb.y.toFixed(1),w:+bb.width.toFixed(1),h:+bb.height.toFixed(1)});}
+    out.texts=texts;
+    var pre=document.createElement('pre');pre.id='geomdump';pre.style.display='none';
+    pre.textContent='GEOMJSON'+JSON.stringify(out)+'GEOMJSON';
+    document.body.appendChild(pre);
+  }catch(e){var pre2=document.createElement('pre');pre2.id='geomdump';pre2.style.display='none';pre2.textContent='GEOMERR'+e;document.body.appendChild(pre2);}
+});
+</script>
+</body>
+</html>
