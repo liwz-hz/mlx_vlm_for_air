@@ -177,15 +177,107 @@ def _hybrid_mlp_call(self, x):
         return _orig_mlp_call(self, x)
 
 
+def _hybrid_delta_call(self, inputs, mask=None, cache=None):
+    """Coarse-grained M-split for delta-net input projections during prefill."""
+    from .models.qwen3_5.language import gated_delta_update, _qwen3_5_advance_lengths_info
+
+    frac = _fraction()
+    B, S, _ = inputs.shape
+
+    if frac <= 0 or S <= 32 or not isinstance(self.in_proj_qkv, nn.QuantizedLinear):
+        return _orig_delta_call(self, inputs, mask, cache)
+
+    try:
+        M_cpu = max(8, int(S * frac)) & ~7
+        M_gpu = S - M_cpu
+        if M_gpu < 16:
+            return _orig_delta_call(self, inputs, mask, cache)
+
+        K = inputs.shape[-1]
+        x_2d = inputs.reshape(S, K)
+        x_mv = memoryview(x_2d)
+
+        w_qkv = _get_weights(self.in_proj_qkv)
+
+        x_gpu = inputs[:, :M_gpu]
+        x_cpu = inputs[:, M_gpu:]
+        qkv_gpu = self.in_proj_qkv(x_gpu)
+
+        def cpu_work():
+            x_u16 = np.frombuffer(x_mv, dtype=np.uint16).reshape(S, K)[M_gpu:]
+            xn = (x_u16.astype(np.uint32) << 16).view(np.float32).reshape(M_cpu, K)
+            return xn @ w_qkv.T
+
+        fut = _get_executor().submit(cpu_work)
+        mx.eval(qkv_gpu)
+
+        qkv_cpu = fut.result()
+        dt = inputs.dtype
+        qkv_c = mx.array(qkv_cpu).astype(dt).reshape(1, M_cpu, -1)
+        mixed_qkv = mx.concatenate([qkv_gpu, qkv_c], axis=1)
+
+        # z/b/a 全走 GPU (不拆, 减少开销)
+        z = self.in_proj_z(inputs)
+        b = self.in_proj_b(inputs)
+        a = self.in_proj_a(inputs)
+        mx.eval(mixed_qkv, z, b, a)
+
+        # Sequential parts on GPU (from original __call__)
+        z = z.reshape(B, S, -1, self.head_v_dim)
+        if cache is not None and cache[0] is not None:
+            conv_state = cache[0]
+            if conv_state.shape[0] != B:
+                conv_state = mx.zeros((B, self.conv_kernel_size - 1, self.conv_dim), dtype=inputs.dtype)
+        else:
+            conv_state = mx.zeros((B, self.conv_kernel_size - 1, self.conv_dim), dtype=inputs.dtype)
+
+        if mask is not None:
+            if mask.shape[0] != B:
+                mask = None
+            else:
+                mixed_qkv = mx.where(mask[..., None], mixed_qkv, 0)
+
+        conv_input = mx.concatenate([conv_state, mixed_qkv], axis=1)
+        if cache is not None:
+            cache.update_window(0, conv_input, self.conv_kernel_size - 1, lengths=cache.lengths)
+
+        conv_out = nn.silu(self.conv1d(conv_input))
+        q, k, v = [
+            t.reshape(B, S, h, d)
+            for t, h, d in zip(
+                mx.split(conv_out, [self.key_dim, 2 * self.key_dim], -1),
+                [self.num_k_heads, self.num_k_heads, self.num_v_heads],
+                [self.head_k_dim, self.head_k_dim, self.head_v_dim],
+            )
+        ]
+        q, k = self._normalize_qk(q, k)
+        out, _ = gated_delta_update(q, k, v, a, b, self.A_log, self.dt_bias,
+                                    mask=mask, use_kernel=not self.training, cache=cache)
+        if cache is not None:
+            if hasattr(cache, "advance"):
+                cache.advance(S)
+                _qwen3_5_advance_lengths_info(cache, S)
+        out = self.norm(out, z)
+        return self.out_proj(out.reshape(B, S, -1))
+
+    except Exception as e:
+        logger.warning("cpu_prefill delta fallback: %s", e)
+        return _orig_delta_call(self, inputs, mask, cache)
+
+
 def install():
-    global _orig_mlp_call, _installed
+    global _orig_mlp_call, _orig_delta_call, _installed
     if _installed or _fraction() <= 0:
         return
-    from .models.qwen3_5.language import Qwen3_5MLP
+    from .models.qwen3_5.language import Qwen3_5MLP, Qwen3_5GatedDeltaNet
+    from .models.qwen3_5.language import gated_delta_update, _qwen3_5_advance_lengths_info
+
     _orig_mlp_call = Qwen3_5MLP.__call__
     Qwen3_5MLP.__call__ = _hybrid_mlp_call
+    _orig_delta_call = Qwen3_5GatedDeltaNet.__call__
+    Qwen3_5GatedDeltaNet.__call__ = _hybrid_delta_call
     _installed = True
-    logger.info("cpu_prefill M-split installed: fraction=%.2f", _fraction())
+    logger.info("cpu_prefill installed: frac=%.2f (MLP + delta-net in_proj)", _fraction())
 
 
 def maybe_install():
