@@ -154,25 +154,62 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
 
 ### 6.1 本机 LLM 推理的本质
 
-LLM 推理是**内存带宽受限**的：每 token 生成需把全部权重（15.2GB）从内存读一遍。吞吐 ≈ 内存带宽 ÷ 权重大小。
+LLM 推理分两个阶段，**瓶颈完全不同**：
 
-| 阶段 | 瓶颈 | 原因 |
-|---|---|---|
-| **prefill** | 算力（GPU FLOPS） | 27B 每 token ≈ 54 GFLOPs；权重 batch 内摊销 |
-| **decode** | 带宽 | 每 token 全量读权重；batch=1 GEMV 延迟受限 |
+| 阶段 | 瓶颈 | 原因 | CPU 能否帮忙 |
+|---|---|---|---|
+| **prefill** | **算力**（GPU FLOPS） | 权重 batch 内摊销（读一遍算 4000 token），GPU 算力满载 95% | ✅ 能（GPU 算力满但带宽空闲） |
+| **decode** | **带宽**（GB/s） | 每 token 全量读 15.2GB 权重，GPU 打满 105 GB/s 内存控制器 | ❌ 不能（被内存控制器饿死） |
+
+**为什么 decode 阶段 CPU 帮不上忙**：Apple Silicon 的 CPU 和 GPU 共享同一块 LPDDR 内存和同一个内存控制器。decode 时 GPU 独占带宽（每 token 读全部 15.2GB 权重），CPU 发出的任何内存请求都要跟 GPU 抢同一个控制器端口，实测 CPU 并发有效带宽从 16 GB/s 跌到 ~2 GB/s，协同后反而比 GPU 独跑慢（0.95×）。
+
+**为什么 prefill 阶段 CPU 能帮忙**：prefill 一次处理全部 prompt token（如 4000 个），权重只读一遍但算 4000 次乘加。GPU 算力满载（95%），但内存带宽只用 ~15%（权重读一遍 15.2GB / 4000 token 计算时间）。CPU 的 AMX 协处理器（~1.4 TFLOPS）可以并行处理部分 token 的矩阵乘法，与 GPU 争抢的不是带宽而是各自独立的算力。
 
 ### 6.2 优化手段（按收益排序）
 
-| 优先级 | 手段 | LPM 下 | 无 LPM | 成本 |
+| 优先级 | 手段 | 阶段 | 收益 | 成本 |
 |---|---|---|---|---|
-| **0** | **关闭低电量模式** | — | **5.9→16.8 tok/s** | 0 |
-| **1** | **升级 mlx 到 0.32.2** | +0（LPM 封顶了带宽） | **16.8→20.0 tok/s** | pip install |
-| 2 | MTP 投机解码 | 2.9→5.1 | — | +238MB |
-| 3 | `--draft-block-size 4` | 5.1→5.9 | 16.8→19.1 | 0 |
-| 4 | APC 前缀缓存 | TTFT 4.8s→0.2s | 同左 | 0 |
-| 5 | KV 8bit + max-kv-size | 防内存失控 | 同左 | 0 |
+| **0** | **关闭低电量模式** | 全局 | **5.9→16.8 tok/s** | 0 |
+| **1** | **升级 mlx 到 0.32.2** | decode | **16.8→20.0 tok/s** | pip install |
+| 2 | MTP 投机解码 | decode | 2.9→5.1 | +238MB |
+| 3 | `--draft-block-size 4` | decode | 5.1→5.9 | 0 |
+| 4 | APC 前缀缓存 | prefill | TTFT 4.8s→0.2s | 0 |
+| 5 | KV 8bit + max-kv-size | 全局 | 防内存失控 | 0 |
+| 6 | CPU/GPU prefill 协同 | prefill | MLP +8% → prefill +5% | 0（`MLX_VLM_CPU_PREFILL=0.10`） |
 
 **最终配置实测（3 轮中位）**：**20.01 tok/s**（计数任务），代码任务 18.3，知识问答 10.6。
+
+### 6.3 CPU/GPU Prefill 协同（`MLX_VLM_CPU_PREFILL`）
+
+**原理**：prefill 是算力瓶颈（GPU 95% 满载），CPU AMX 协处理器有 ~1.4 TFLOPS 闲着。按 token 维度切分——GPU 算 90% 的 token（走 4bit 量化 kernel），CPU 算 10% 的 token（走 fp32 BLAS/AMX），两者完全并行。
+
+```
+输入: [token_0 ... token_3599] [token_3600 ... token_3999]
+        └── GPU 90% (量化MLP) ──┘└── CPU 10% (BLAS/AMX) ──┘
+                     ↓                        ↓
+                concatenate 一次合并
+```
+
+**启用**：环境变量 `MLX_VLM_CPU_PREFILL=0.10`（默认关闭）
+
+**实测收益**（M=4000 token 全 MLP，3 投影+激活）：
+
+| 配置 | 耗时 | 提速 |
+|---|---|---|
+| GPU 独跑 | 289.8 ms | — |
+| CPU/GPU 协同 (10%) | **268.8 ms** | **+8%** |
+
+端到端：MLP 占 prefill ~65% → prefill 整体提速 ~5% → TTFT 18s → 17.1s。
+
+**限制**：
+- 只在 prefill（M > 32）激活，decode 自动跳过（M=4~5 走原路，零开销）
+- CPU AMX（1.4 TFLOPS）仅为 GPU（8.0 TFLOPS）的 18%，CPU 分数超 12% 后 CPU 变为瓶颈，性能反而下降
+- M < 1000 时固定开销（~4ms）吃掉收益，实际无提升
+
+**实现要点**（`mlx_vlm/cpu_prefill.py`）：
+- CPU 线程 100% 纯 numpy（零 MLX API 调用，无 GIL 争抢）
+- 用 `memoryview(mx_array)` 零拷贝读取统一内存中的 bf16 输入（0.01ms vs tolist 的 58ms）
+- CPU 结果通过 `mx.array(numpy)` + `mx.concatenate` 合并（~2ms，不用预分配 buffer 避免并发写入问题）
 
 ### 6.3 各层性能数据（无 LPM + mlx 0.32.2）
 
