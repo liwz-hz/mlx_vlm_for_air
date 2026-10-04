@@ -358,6 +358,10 @@ def main():
 
     maybe_enable_from_env()
 
+    from ..cpu_prefill import maybe_install
+
+    maybe_install()
+
     log_level = getattr(logging, args.log_level.upper(), logging.INFO)
     logging.basicConfig(
         level=log_level,
