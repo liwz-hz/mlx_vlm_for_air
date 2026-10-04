@@ -1,10 +1,11 @@
-"""CPU/GPU co-execution for prefill MLP projections.
+"""CPU/GPU co-execution for prefill MLP — M-split, fully zero-copy, no GPU dependency in CPU thread.
 
-During prefill (compute-bound), splits MLP gate/up/down projections by
-output dimension: GPU handles ~85%, CPU (Accelerate BLAS/AMX) handles ~15%
-in parallel. Uses zero-copy memoryview on Apple Silicon unified memory.
+CPU thread reads bf16 input directly from unified memory (memoryview),
+converts to fp32 in numpy, runs full MLP via Accelerate BLAS/AMX, writes
+bf16 result directly into MLX output buffer. Zero MLX API calls in the
+CPU thread — no GIL contention, no GPU sync.
 
-Enable via MLX_VLM_CPU_PREFILL=<fraction> (e.g. 0.15); default disabled.
+Enable via MLX_VLM_CPU_PREFILL=<fraction> (e.g. 0.10); default disabled.
 """
 
 import logging
@@ -19,10 +20,9 @@ logger = logging.getLogger(__name__)
 
 _fraction_val = None
 _executor = None
-_weight_cache = {}
-_stats = {"calls": 0, "prefill_splits": 0}
 _orig_mlp_call = None
 _installed = False
+_mlp_weights = {}
 
 
 def _fraction():
@@ -33,7 +33,7 @@ def _fraction():
 
 
 def _enabled():
-    return 0.0 < _fraction() <= 0.4 and not _installed
+    return 0.0 < _fraction() <= 0.3 and not _installed
 
 
 def _get_executor():
@@ -43,95 +43,97 @@ def _get_executor():
     return _executor
 
 
-def _mx_view(arr):
-    """Zero-copy numpy view of an evaluated MLX fp32 array (unified memory)."""
-    arr = arr.astype(mx.float32)
-    mx.eval(arr)
-    mv = memoryview(arr)
-    return np.frombuffer(mv, dtype=np.float32).reshape(arr.shape)
-
-
-def _get_cpu_weights(linear, n_cpu):
-    """Dequantized CPU weight rows as numpy fp32 (zero-copy view). Cached."""
-    key = id(linear)
-    cached = _weight_cache.get(key)
-    if cached is not None and cached[0] is linear and cached[1] == n_cpu:
-        return cached[2]
-
-    w_deq = mx.dequantize(
-        linear["weight"][:n_cpu],
-        linear["scales"][:n_cpu],
-        linear["biases"][:n_cpu],
-        group_size=linear.group_size,
-        bits=linear.bits,
+def _dequant_np(linear):
+    """Dequantize to fp32 numpy (zero-copy via memoryview after GPU eval)."""
+    w = mx.dequantize(
+        linear["weight"], linear["scales"], linear["biases"],
+        group_size=linear.group_size, bits=linear.bits,
     )
-    w_np = _mx_view(w_deq)
-    _weight_cache[key] = (linear, n_cpu, w_np)
-    return w_np
+    w_f32 = w.astype(mx.float32)
+    mx.eval(w_f32)
+    K = linear["weight"].shape[1] * 32 // linear.bits
+    return np.frombuffer(memoryview(w_f32), dtype=np.float32).reshape(-1, K)
 
 
-def _split_projection(linear, x, fraction):
-    """Split a quantized projection between GPU and CPU by output rows."""
-    N = linear["weight"].shape[0]
-    n_cpu = int(N * fraction) & ~7
-    if n_cpu < 16 or N - n_cpu < 16:
-        return linear(x)
-
-    B, S, K = x.shape
-    x_2d = x.reshape(B * S, K)
-
-    x_np = _mx_view(x_2d)
-    w_np = _get_cpu_weights(linear, n_cpu)
-
-    def cpu_work():
-        return x_np @ w_np.T
-
-    fut = _get_executor().submit(cpu_work)
-
-    N_gpu = N - n_cpu
-    gpu_out = mx.quantized_matmul(
-        x_2d,
-        linear["weight"][n_cpu:],
-        scales=linear["scales"][n_cpu:],
-        biases=linear["biases"][n_cpu:],
-        transpose=True,
-        group_size=linear.group_size,
-        bits=linear.bits,
-        mode=linear.mode,
-    )
-    mx.eval(gpu_out)
-
-    cpu_out = fut.result()
-    cpu_mx = mx.array(cpu_out.tolist()).astype(x.dtype)
-    cpu_mx = cpu_mx.reshape(*x.shape[:-1], n_cpu)
-    gpu_mx = gpu_out.reshape(*x.shape[:-1], N_gpu)
-
-    result = mx.concatenate([cpu_mx, gpu_mx], axis=-1)
-    mx.eval(result)
-    _stats["prefill_splits"] += 1
-    return result
-
-
-def _swiglu(gate, up):
-    from ..models.activations import swiglu
-    return swiglu(gate, up)
+def _get_weights(mlp):
+    key = id(mlp)
+    cached = _mlp_weights.get(key)
+    if cached is not None and cached[0] is mlp:
+        return cached[1], cached[2], cached[3]
+    wg = _dequant_np(mlp.gate_proj)
+    wu = _dequant_np(mlp.up_proj)
+    wd = _dequant_np(mlp.down_proj)
+    _mlp_weights[key] = (mlp, wg, wu, wd)
+    return wg, wu, wd
 
 
 def _hybrid_mlp_call(self, x):
-    """Replacement for Qwen3_5MLP.__call__ with CPU/GPU prefill split."""
-    _stats["calls"] += 1
     frac = _fraction()
-    S = x.shape[1] if x.ndim == 3 else x.shape[0]
+    B, S, K = x.shape
+    M = B * S
 
-    if frac <= 0 or S <= 8 or not isinstance(self.gate_proj, nn.QuantizedLinear):
+    if frac <= 0 or M <= 32 or not isinstance(self.gate_proj, nn.QuantizedLinear):
+        return _orig_mlp_call(self, x)
+
+    M_cpu = max(8, int(M * frac)) & ~7
+    M_gpu = M - M_cpu
+    if M_gpu < 16:
         return _orig_mlp_call(self, x)
 
     try:
-        gate = _split_projection(self.gate_proj, x, frac)
-        up = _split_projection(self.up_proj, x, frac)
-        hidden = _swiglu(gate, up)
-        down = _split_projection(self.down_proj, hidden, frac)
-        return down
+        x_2d = x.reshape(M, K)
+        N_out = self.down_proj["weight"].shape[0]
+
+        # Pre-allocate output + get writable view (zero-copy)
+        out = mx.zeros((M, N_out), dtype=mx.bfloat16)
+        mx.eval(out)
+        out_np = np.frombuffer(memoryview(out), dtype=np.uint16).reshape(M, N_out)
+
+        # Get dequantized weights (cached, zero-copy fp32 views)
+        wg, wu, wd = _get_weights(self)
+
+        # Get zero-copy view of input (bf16 as uint16)
+        # CPU reads directly from unified memory — no GPU operation needed
+        x_mv = memoryview(x_2d)
+
+        # Submit GPU work (lazy graph, runs when eval'd)
+        x_gpu = x_2d[:M_gpu]
+        gate_g = self.gate_proj(x_gpu)
+        up_g = self.up_proj(x_gpu)
+        hidden_g = gate_g * mx.sigmoid(gate_g) * up_g
+        out_gpu = self.down_proj(hidden_g)
+
+        # CPU thread: 100% numpy, zero MLX calls, no GIL contention
+        def cpu_work():
+            # Read bf16 input as uint16 from unified memory (zero-copy)
+            x_u16 = np.frombuffer(x_mv, dtype=np.uint16).reshape(M, K)[M_gpu:]
+            # bf16 → fp32 (bit shift, CPU-side, no GPU)
+            x_np = (x_u16.astype(np.uint32) << 16).view(np.float32).reshape(M_cpu, K)
+            # MLP: 3 matmuls + swiglu (Accelerate BLAS/AMX)
+            gate = x_np @ wg.T
+            up = x_np @ wu.T
+            hidden = gate * (1.0 / (1.0 + np.exp(-gate.astype(np.float32)))) * up
+            result = hidden @ wd.T
+            # fp32 → bf16, write DIRECTLY into MLX output buffer (zero-copy)
+            out_np[M_gpu:, :] = (result.view(np.uint32) >> 16).astype(np.uint16)
+
+        fut = _get_executor().submit(cpu_work)
+
+        # Evaluate GPU graph (runs in parallel with CPU thread)
+        out_gpu_bf = out_gpu.astype(mx.bfloat16)
+        mx.eval(out_gpu_bf)
+
+        # Copy GPU result into output buffer (unified memory memcpy)
+        gpu_np = np.frombuffer(
+            memoryview(out_gpu_bf), dtype=np.uint16
+        ).reshape(M_gpu, N_out)
+        out_np[:M_gpu, :] = gpu_np
+
+        # Wait for CPU
+        fut.result()
+
+        return out.reshape(B, S, N_out)
+
     except Exception as e:
         logger.warning("cpu_prefill fallback: %s", e)
         return _orig_mlp_call(self, x)
@@ -141,11 +143,11 @@ def install():
     global _orig_mlp_call, _installed
     if _installed or _fraction() <= 0:
         return
-    from ..models.qwen3_5.language import Qwen3_5MLP
+    from .models.qwen3_5.language import Qwen3_5MLP
     _orig_mlp_call = Qwen3_5MLP.__call__
     Qwen3_5MLP.__call__ = _hybrid_mlp_call
     _installed = True
-    logger.info("cpu_prefill installed: fraction=%.2f", _fraction())
+    logger.info("cpu_prefill M-split installed: fraction=%.2f", _fraction())
 
 
 def maybe_install():
