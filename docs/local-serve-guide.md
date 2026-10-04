@@ -239,7 +239,7 @@ nohup python -m mlx_vlm.server \
   --draft-block-size 4 \
   --host 127.0.0.1 --port 8080 \
   --kv-bits 8 \
-  --max-kv-size 49152 \
+  --max-kv-size 98304 \
   > server.log 2>&1 & disown
 ```
 
@@ -247,9 +247,25 @@ nohup python -m mlx_vlm.server \
 |---|---|---|
 | `APC_ENABLED=1` | 自动前缀缓存（**默认关闭**） | 重复前缀 TTFT 4.8s → 0.2s |
 | `--kv-bits 8` | KV cache 8bit 量化 | KV 内存减半 |
-| `--max-kv-size N` | KV token 上限，防长会话内存失控 | 峰值从 22.1GB 得到控制 |
+| `--max-kv-size 98304` | KV token 上限 96K（原 48K，2026-10 翻倍） | 满载 KV ≈ 3GB；峰值内存 ≈ 24GB 仍安全 |
 | `--draft-model` + 自动识别 `--draft-kind mtp` | MTP 投机解码 | decode 2.9→5.1 tok/s |
 | `--draft-block-size 4` | 每轮验证 4 个 draft token（默认 3） | 5.1→5.9 tok/s（无LPM: 16.8→19.1） |
+
+注：`max_kv_size` 是 live knob（改后无需重载模型）。APC 块池 4096 块 = 64K token 前缀缓存；
+若需缓存完整 96K 前缀可提 `APC_NUM_BLOCKS=6144`（满载 +1GB）。
+
+### 4.2 KV 8bit 量化的质量评估（2026-10 实测）
+
+方法（`tools/kv_quant_eval.py`，热友好：每配置 ~5K token prefill 工作量）：
+1. **top1 一致率**：同一文本取 5 个递增前缀（2K-12K 字符），对比 kv8 与 bf16 两个 server
+   的下一 token 贪婪选择 → **5/5 一致**
+2. **长文本一致性**：温度 0 生成 800+ 字符 × 5 题，kv8 vs bf16 → **2/5 完全一致**，
+   3/5 在中途分叉（近平局 token 被噪声翻转，属混沌放大，两边文本均合理）
+3. 分布级对比（top-20 logprob）：当前 server 的 logprob 返回路径为占位值（`logprob:0.0`、
+   top 列表恒空，`--top-logprobs-k 20` 无效），待修；方法脚本已备好
+
+结论：kv8 噪声量级 ~0.2-0.4%（与 bf16 自身舍入同阶），**无可见质量问题**；
+收益为 KV 内存/带宽减半（decode 提速 + 上下文容量翻倍）。若做严肃评测可跑困惑度对比。
 
 ## 5. API 调用
 
@@ -432,3 +448,64 @@ footprint <server_pid>       # 真实占用（含 Metal）
 | 峰值内存 | 16.4GB+ | 16.4GB+ |
 
 **总结**：M5 Air 32GB 跑 27B-4bit，关闭 LPM + 全优化配置可达 **20 tok/s**——已具备实际 agent 使用价值。
+
+## 10. Prefill 深度分析：为什么 CPU/GPU 协同计算在本机为负收益（2026-10 实测）
+
+### 10.1 Bound 点剖析（M=2048，48 delta 层 + 16 全注意力层）
+
+| 组件 | 占 prefill 时间 | 实测吞吐 | 状态 |
+|---|---|---|---|
+| 量化 GEMM（MLP+各投影） | **~92%** | 11.2-12.2 TFLOPS | **已达 GPU 峰值（bf16 mm 13.2）的 92-95%，无内核级余量** |
+| delta core（串行扫描 kernel） | ~7.6% | 0.48 TFLOPS | 唯一"低效"组件，但绝对值小 |
+| sdpa（全注意力） | ~1.5% | 18-20 TFLOPS | 极快，无需优化 |
+| lm_head | ~0 | — | 分块路径丢弃中间 chunk logits（lazy 不物化），无浪费 |
+
+实测参考（server 自身日志，无 APC，温度上升后速率递减）：
+- 798 tok: 179-181 tok/s
+- 3066 tok: 154-188 tok/s
+- 6094 tok: 102-140 tok/s（**43.5s→54.7s 单调劣化 = 无风扇热降频**）
+
+### 10.2 CPU 协同计算（`MLX_VLM_CPU_PREFILL`，默认关闭）的完整验证
+
+理论：CPU（AMX 1.65 TFLOPS）可为 11.5 TFLOPS 的 GPU 增加 ~14% 算力 → 理想 +12%。
+实现（v3.1，`mlx_vlm/cpu_prefill.py` + `mlx_vlm/cpu_share.c`）做到了工程极限：
+- MLP K-split（无 concat：`down([h_gpu|h_cpu]) = h_gpu@W_l + h_cpu@W_r`）
+- BNNSMatMul bf16（CPU 直接吃 bf16 输入，省 GPU 端 cast；无公开 fp16 2× AMX API，实测 bf16 仅 1.73T）
+- 整个 CPU 份额单次 ctypes C 调用（GIL 全释放——Python 循环会被 MLX async 派发线程的 GIL 竞争拖慢 +40%）
+- BNNS `n_threads=8` + `QOS_CLASS_USER_INTERACTIVE`（默认 12 线程与 Metal 派发线程抢核心，性能断崖）
+
+逐级实测（MLP 单算子，M=2048，交替基线）：
+| 配置 | MLP op |
+|---|---|
+| GPU-only | 97-98 ms |
+| + 上述全部修复，frac=0.10-0.12 | 91 ms（**+6~8%**） |
+
+**但端到端 TTFT（同热状态 A/B 对照）**：
+
+| prompt | 无 co-exec | 有 co-exec (0.11) |
+|---|---|---|
+| ~4KB | 4.16s | 4.40s（-5.8%） |
+| ~16KB | 16.34s | 18.26s（**-11.8%**） |
+| ~32KB | 43.54s | 44.68s（-2.6%） |
+
+结论：**端到端为负的机理（2026-10-04 补充进程隔离对照实验后修正）**：
+1. 跨进程干扰实测为零（交替相位对照：GPU qmm 29.9→30.5ms 纹丝不动；独立进程 CPU 在并发相位无额外劣化）——
+   **GPU 从未被 CPU 拖慢**，"功耗共享拖慢 GPU" 的说法不成立；
+2. Apple 功耗调度优先保 GPU：持续负载下 **CPU 集群单调热降频**（子进程 183→210ms，无风扇），
+   CPU 有效算力从 1.65T 跌至 ~1.0T，卸载比例从 14% 缩水到 ~8%；
+3. 每层 `fut.result()` 硬同步是结构性的：eager MLX 无法对外部内存写入建立图依赖，CPU 份额变慢时
+   GPU 队列排空产生空泡（~30ms/层 × 64 层 ≈ 实测 16KB 差距 -1.9s）；
+4. **多进程方案被排除**：GIL 已由单次 ctypes 消除（非剩余瓶颈）；跨进程干扰本就为零（无收益）；
+   MLX 的 Metal buffer 无法跨进程共享，激活值需经 POSIX shm 往返拷贝（+4~6ms/op，严格劣于零拷贝进程内设计）；
+   macOS 无硬绑核 API（`thread_policy_set` 仅建议性，QoS 已应用）。
+
+**微基准 +6~8%（MLP 单算子，同热状态交替基线）在持续负载下被 2+3 吞噬。数值上 CPU fp32/bf16
+路径更精确（greedy 输出前缀 3/3 一致），但性能为负，默认关闭。**
+
+### 10.3 剩余真实优化空间（按投入产出排序）
+
+1. **delta core 融合分块 kernel**：现 kernel 对 T 串行扫描（0.48 TFLOPS，26× 低于 GPU 能力上限）；
+   FLA 风格 chunk-parallel 融合 kernel 理论可到 3+ TFLOPS → prefill **-4~5%**。工程量大（正确性验证难）。
+2. **自定义 qmm kernel**：qmm 与 bf16 mm 峰值差 5-8%（dequant 在 kernel 内的开销）→ prefill **-4%**。
+3. **热管理**：长 prefill（>4k tok）实际受热降频支配（6094 tok 三连发 43.5→52.9→59.8s），任何算子优化在持续负载下都会打折。
+4. 小投影拆分（qkv/z/out/q/o）已逐一实测为负：消费者依赖拆分输出导致 GPU 空转，2.8ms 收益 < 4ms glue。
