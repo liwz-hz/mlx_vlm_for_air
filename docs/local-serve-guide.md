@@ -52,19 +52,136 @@ modelscope download --model mlx-community/Qwen3.8-27B-MTP-4bit   # MTP drafter�
 pip install mlx==0.32.2 mlx-metal==0.32.2   # 0.32.2 的 M=4 skinny GEMV 比 0.31.2 快 67%
 ```
 
-### 2.4 系统要求：关闭低电量模式（LPM）
+## 2. 硬件规格与性能实测
 
-**LPM 是 27B 推理的最大性能杀手**。macOS 低电量模式将 GPU 频率从 ~1400MHz 压到 ~500MHz，内存带宽从 ~105 GB/s 降到 ~25-35 GB/s（LLM 推理是带宽受限的）。
+### 2.1 系统信息（来源：`system_profiler SPHardwareDataType`）
 
-| 指标 | LPM 开启 | LPM 关闭 |
+| 项目 | 值 | 获取命令 |
 |---|---|---|
-| GPU 频率 | 486-636 MHz | ~1400+ MHz |
-| 内存带宽 | 25-35 GB/s | **105 GB/s** |
-| decode 吞吐 | 5.9 tok/s | **20.0 tok/s** |
+| 机型 | MacBook Air (Mac17,4) | `system_profiler SPHardwareDataType` |
+| 芯片 | Apple M5 | `sysctl -n machdep.cpu.brand_string` |
+| 内存 | 32 GB LPDDR5 (Micron) | `system_profiler SPMemoryDataType` |
+| CPU 核心 | 10 = 4 性能核 + 6 能效核 | `sysctl hw.perflevel0.physicalcpu hw.perflevel1.physicalcpu` |
+| GPU 核心 | 10 | `ioreg -l \| grep gpu-core-count` |
 
-关闭方式：系统设置 → 电池 → 低电量模式 → 关闭。AC 供电下也可以关。
+### 2.2 CPU 算力
 
-### 2.5 显存/内存预算
+| 指标 | 值 | 来源 |
+|---|---|---|
+| 性能核（P-core）最高频率 | ~4.5 GHz | `powermetrics --samplers cpu_power`（E-cluster 实测 3048 MHz，P-cluster 更高） |
+| 能效核（E-core）最高频率 | ~3.0 GHz | 同上 |
+| L1 缓存（每核） | I: 128KB / D: 64KB | `sysctl hw.l1icachesize hw.l1dcachesize` |
+| L2 缓存 | 6 MB | `sysctl hw.l2cachesize` |
+| AMX fp32 矩阵乘 | **1,418-1,554 GFLOPS** | 实测（见下方方法） |
+| AMX 并发（GPU 同时跑） | 16.4 GB/s 有效带宽 | 实测（GPU bf16 GEMV 同时跑 numpy BLAS） |
+
+**CPU 算力获取方法**：
+```bash
+# AMX 矩阵乘吞吐（需安装 numpy，自动调 Accelerate BLAS）
+python3 -c "
+import numpy as np, time
+a = np.random.randn(400, 5120).astype(np.float32)
+b = np.random.randn(5120, 17408).astype(np.float32)
+c = a @ b  # 预热
+t0 = time.perf_counter()
+c = a @ b
+t = time.perf_counter() - t0
+print(f'CPU fp32 GEMM: {2*400*5120*17408/t/1e9:.0f} GFLOPS')
+"
+```
+
+### 2.3 GPU 算力
+
+| 指标 | 值 | 来源 |
+|---|---|---|
+| GPU 核心数 | 10 | `ioreg -l \| grep gpu-core-count` |
+| 频率范围 | 338 - 1578 MHz | `powermetrics --samplers gpu_power` |
+| 满载频率（无 LPM） | 1084-1578 MHz | 同上（GEMV 持续负载时实测） |
+| 满载频率（LPM 开启） | **486-636 MHz** | 同上（LPM 下实测） |
+| 满载功耗（无 LPM） | ~2.8 W | 同上 |
+| bf16 GEMM 峰值算力 | **8.0-8.4 TFLOPS** | 实测（见下方方法） |
+| bf16 GEMV 持续读带宽 | **105.2 GB/s** | 实测（见下方方法） |
+| 4bit 量化 matmul M=1 | 82.9 GB/s 有效 | 实测 |
+
+**GPU 算力获取方法**：
+```bash
+# bf16 GEMM 峰值算力
+python3 -c "
+import mlx.core as mx, time
+a = mx.random.normal((400, 5120)).astype(mx.bfloat16)
+b = mx.random.normal((17408, 5120)).astype(mx.bfloat16)
+c = a @ b.T; mx.eval(c)  # 预热
+t0 = time.perf_counter()
+c = a @ b.T; mx.eval(c)
+t = time.perf_counter() - t0
+print(f'GPU bf16 GEMM: {2*400*5120*17408/t/1e12:.1f} TFLOPS')
+"
+
+# bf16 GEMV 持续读带宽
+python3 -c "
+import mlx.core as mx, time
+w = mx.random.normal((17408, 5120)).astype(mx.float16)
+x = mx.random.normal((1, 5120)).astype(mx.float16)
+for _ in range(50): y = x @ w.T; mx.eval(y)  # 预热
+t_end = time.perf_counter() + 6
+n = 0
+while time.perf_counter() < t_end:
+    for _ in range(20): y = x @ w.T; mx.eval(y)
+    n += 20
+dt = 6
+print(f'GPU GEMV 带宽: {w.nbytes * n / dt / 1e9:.1f} GB/s')
+"
+```
+
+**GPU 频率/功耗监控**：
+```bash
+sudo powermetrics --samplers gpu_power -i 1000 -n 3
+# 输出 GPU HW active frequency, GPU Power, residency per frequency bin
+```
+
+### 2.4 内存带宽
+
+| 指标 | 值 | 来源 |
+|---|---|---|
+| 内存类型 | LPDDR5 | `system_profiler SPMemoryDataType` |
+| 容量 | 32 GB | 同上 |
+| 内存总线宽度 | 128-bit（推算） | Apple 基础 M 系列均为 128-bit |
+| 理论带宽 | ~120-150 GB/s（推算） | LPDDR5-6400 × 128-bit ≈ 102 GB/s；LPDDR5X-7500 × 128-bit ≈ 150 GB/s |
+| **实测 GPU 有效读带宽** | **105.2 GB/s** | bf16 GEMV 持续测量（上方方法） |
+| GPU+CPU 并发 | 97.3 + 16.4 = 113.7 GB/s | 实测（GPU GEMV + numpy BLAS 同时跑） |
+
+**推算说明**：Apple 不公开 M5 的内存速度。从实测 GEMV 105.2 GB/s（含反量化开销，有效带宽低于总线峰值）和 M4（基础版）120 GB/s 的公开规格推断，M5（基础版）的理论内存带宽约 120-150 GB/s。
+
+### 2.5 LPM 开启/关闭对比
+
+| 指标 | LPM 开启 | LPM 关闭 | 差异 |
+|---|---|---|---|
+| GPU 满载频率 | 486-636 MHz | 1084-1578 MHz | **2.5-2.8×** |
+| GPU 满载功耗 | ~2.5 W | ~2.8 W | 仅 +12% |
+| GPU bf16 GEMV 带宽 | 25-35 GB/s | **105 GB/s** | **3-4×** |
+| decode 吞吐（全优化） | 5.9 tok/s | **20.0 tok/s** | **3.4×** |
+| prefill 速度（M=4000） | ~60 tok/s | ~200 tok/s | **3.3×** |
+
+**关键发现**：LPM 牺牲 3-4× 性能，仅换来 12% 功耗节省。对于 AC 供电场景，关闭 LPM 是零成本的最大优化。
+
+**LPM 状态检查**：`pmset -g | grep lowpower`（0=关，1=开）
+
+### 2.6 各阶段实测性能汇总（无 LPM + mlx 0.32.2）
+
+| 层级 | 操作 | 性能 |
+|---|---|---|
+| GPU | bf16 GEMM (400×5120)×(5120×17408) | 8.0 TFLOPS |
+| GPU | bf16 GEMV (1×5120)×(5120×17408) | 105.2 GB/s |
+| GPU | 4bit 量化 matmul M=1 | 82.9 GB/s |
+| GPU | 4bit 量化 matmul M=4 | 81.2 GB/s（0.154ms/token） |
+| CPU | AMX fp32 GEMM (400×5120)×(5120×17408) | 1554 GFLOPS |
+| CPU | NEON 4bit GEMV（自定义 kernel） | 11.3 GB/s |
+| 并发 | GPU GEMV + CPU BLAS | GPU 97.3 + CPU 16.4 GB/s |
+| 端到端 | decode（MTP block4 + kv8 + APC） | **20.0 tok/s** |
+| 端到端 | prefill（M=3518, 首次） | ~200 tok/s |
+| 端到端 | prefill（APC 命中后） | ~0.2s TTFT |
+
+### 2.7 显存/内存预算
 
 | 组件 | 占用 |
 |---|---|
