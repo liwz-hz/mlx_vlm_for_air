@@ -1,16 +1,31 @@
-"""CPU/GPU co-execution for prefill MLP — M-split, fully zero-copy, no GPU dependency in CPU thread.
+"""CPU/GPU co-execution v3.1 for prefill.
 
-CPU thread reads bf16 input directly from unified memory (memoryview),
-converts to fp32 in numpy, runs full MLP via Accelerate BLAS/AMX, writes
-bf16 result directly into MLX output buffer. Zero MLX API calls in the
-CPU thread — no GIL contention, no GPU sync.
+Bound-point analysis (M5 Air, Qwen3.5-27B-4bit, prefill M>=512):
+quantized GEMMs run at 11.2-12.2 TFLOPS (92-95% of GPU peak) and cover
+~92% of prefill time, so the only lever on them is adding the CPU's
+~1.7 TFLOPS (AMX). Per-op glue (casts, concats, syncs) eats most of the
+benefit on small projections, so v3.1 splits only:
 
-Enable via MLX_VLM_CPU_PREFILL=<fraction> (e.g. 0.10); default disabled.
+  * MLP — K-split, zero concats: gate/up are row-split (GPU computes
+    columns [0, I-nc), CPU the rest via BNNSMatMul bf16 straight from
+    the bf16 MLX buffer — no fp32 cast); the CPU applies NEON swiglu to
+    its own columns and runs the matching K-slice of down_proj via
+    sgemm, writing fp32 directly into an MLX buffer. The GPU combines
+    with a single add: down_gpu + cpu.astype(bf16).
+Every other projection (delta-net qkv/z/out, attention q/o) was measured
+NEGATIVE: their consumer ops depend on the split output, so the GPU idles
+while the CPU finishes — the offload benefit (<2.8ms) never covers the
+concat+sync glue. The MLP is the only op whose CPU share fully overlaps
+its own GPU share.
+
+Enable via MLX_VLM_CPU_PREFILL=<fraction> (e.g. 0.125); default off.
+Decode (M < 512) is untouched.
 """
 
+import ctypes
 import logging
 import os
-import ctypes
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import mlx.core as mx
@@ -19,55 +34,11 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# Load NEON swiglu (5x faster than numpy: fused single-pass, zero intermediates)
-_swiglu_lib = None
-def _get_swiglu_lib():
-    global _swiglu_lib
-    if _swiglu_lib is None:
-        try:
-            import pathlib
-            lib_path = pathlib.Path(__file__).parent / "libswiglu_neon.dylib"
-            if lib_path.exists():
-                _swiglu_lib = ctypes.CDLL(str(lib_path))
-                _swiglu_lib.swiglu_neon.argtypes = [
-                    ctypes.POINTER(ctypes.c_float),
-                    ctypes.POINTER(ctypes.c_float),
-                    ctypes.POINTER(ctypes.c_float),
-                    ctypes.c_int,
-                ]
-            else:
-                _swiglu_lib = False
-        except Exception:
-            _swiglu_lib = False
-    return _swiglu_lib or None
-
-
-def _swiglu_np(gate, up):
-    """Fallback numpy swiglu (if NEON lib not available)."""
-    return gate * (1.0 / (1.0 + np.exp(-gate))) * up
-
-
-def _swiglu_fast(gate, up):
-    """NEON swiglu: 5x faster than numpy, zero intermediate arrays."""
-    lib = _get_swiglu_lib()
-    if lib is None:
-        return _swiglu_np(gate, up)
-    gate_c = np.ascontiguousarray(gate)
-    up_c = np.ascontiguousarray(up)
-    out = np.empty(gate_c.shape, dtype=np.float32)
-    lib.swiglu_neon(
-        gate_c.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        up_c.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        gate_c.size,
-    )
-    return out
-
+_MIN_M = 512
+_pool = ThreadPoolExecutor(max_workers=1)
 _fraction_val = None
-_executor = None
-_orig_mlp_call = None
 _installed = False
-_mlp_weights = {}
+_orig_mlp_call = None
 
 
 def _fraction():
@@ -78,206 +49,396 @@ def _fraction():
 
 
 def _enabled():
-    return 0.0 < _fraction() <= 0.3 and not _installed
+    return 0.0 < _fraction() <= 0.35 and not _installed
 
 
-def _get_executor():
-    global _executor
-    if _executor is None:
-        _executor = ThreadPoolExecutor(max_workers=1)
-    return _executor
-
-
-def _dequant_np(linear):
-    """Dequantize to fp32 numpy (zero-copy via memoryview after GPU eval)."""
-    w = mx.dequantize(
-        linear["weight"], linear["scales"], linear["biases"],
-        group_size=linear.group_size, bits=linear.bits,
+def _lin_ok(lin):
+    return (
+        isinstance(lin, nn.QuantizedLinear)
+        and lin.bits == 4
+        and lin.group_size == 64
     )
-    w_f32 = w.astype(mx.float32)
-    mx.eval(w_f32)
-    K = linear["weight"].shape[1] * 32 // linear.bits
-    return np.frombuffer(memoryview(w_f32), dtype=np.float32).reshape(-1, K)
 
 
-def _get_weights(mlp):
-    key = id(mlp)
-    cached = _mlp_weights.get(key)
-    if cached is not None and cached[0] is mlp:
-        return cached[1], cached[2], cached[3]
-    wg = _dequant_np(mlp.gate_proj)
-    wu = _dequant_np(mlp.up_proj)
-    wd = _dequant_np(mlp.down_proj)
-    _mlp_weights[key] = (mlp, wg, wu, wd)
-    return wg, wu, wd
+def _np_view(arr, dtype, *shape):
+    return np.frombuffer(memoryview(arr), dtype=dtype).reshape(*shape)
+
+
+# ---------------------------------------------------------------------------
+# BNNS bf16 GEMM (AMX): C[M,N] fp32 = A[M,K] bf16 @ B[N,K] bf16 ^T
+# ---------------------------------------------------------------------------
+
+_DT_BF16 = 0x10000 | 0x8000 | 16
+_DT_F32 = 0x10000 | 32
+_LAYOUT_2D_LAST_MAJOR = 0x28000
+
+_MAX_DIM = 8
+
+_bnns_lock = threading.Lock()
+_bnns = None
+_bnns_ws = {}
+
+
+class _Desc(ctypes.Structure):
+    _fields_ = [
+        ("flags", ctypes.c_uint32),
+        ("layout", ctypes.c_uint32),
+        ("size", ctypes.c_size_t * _MAX_DIM),
+        ("stride", ctypes.c_size_t * _MAX_DIM),
+        ("data", ctypes.c_void_p),
+        ("data_type", ctypes.c_uint32),
+        ("table_data", ctypes.c_void_p),
+        ("table_data_type", ctypes.c_uint32),
+        ("data_scale", ctypes.c_float),
+        ("data_bias", ctypes.c_float),
+    ]
+
+
+class _FilterParams(ctypes.Structure):
+    _fields_ = [
+        ("flags", ctypes.c_uint32),
+        ("n_threads", ctypes.c_size_t),
+        ("alloc_memory", ctypes.c_void_p),
+        ("free_memory", ctypes.c_void_p),
+    ]
+
+
+def _bnns_init():
+    global _bnns
+    if _bnns is not None:
+        return _bnns
+    try:
+        import ctypes.util
+
+        lib = ctypes.CDLL(
+            "/System/Library/Frameworks/Accelerate.framework/Versions/A/"
+            "Frameworks/vecLib.framework/libBNNS.dylib"
+        )
+        lib.BNNSMatMulWorkspaceSize.restype = ctypes.c_ssize_t
+        lib.BNNSMatMulWorkspaceSize.argtypes = [
+            ctypes.c_bool,
+            ctypes.c_bool,
+            ctypes.c_float,
+            ctypes.POINTER(_Desc),
+            ctypes.POINTER(_Desc),
+            ctypes.POINTER(_Desc),
+            ctypes.POINTER(_FilterParams),
+        ]
+        lib.BNNSMatMul.restype = ctypes.c_int
+        lib.BNNSMatMul.argtypes = [
+            ctypes.c_bool,
+            ctypes.c_bool,
+            ctypes.c_float,
+            ctypes.POINTER(_Desc),
+            ctypes.POINTER(_Desc),
+            ctypes.POINTER(_Desc),
+            ctypes.c_void_p,
+            ctypes.POINTER(_FilterParams),
+        ]
+        _bnns = lib
+    except Exception:
+        _bnns = False
+        logger.warning("cpu_prefill: BNNS unavailable, co-exec disabled")
+    return _bnns
+
+
+def _desc2d(rows, cols, dtype, ptr):
+    d = _Desc()
+    d.flags = 0
+    d.layout = _LAYOUT_2D_LAST_MAJOR
+    d.size[0] = rows
+    d.size[1] = cols
+    d.stride[0] = cols  # row-major: last dim contiguous
+    d.stride[1] = 1
+    d.data = ptr
+    d.data_type = dtype
+    return d
+
+
+def _bnns_gemm_bf16(a_u16, b_u16, c_f32):
+    """C[M,N] fp32 = A[M,K] bf16 @ B[N,K] bf16 ^T. numpy views, any thread."""
+    lib = _bnns or _bnns_init()
+    if not lib:
+        raise RuntimeError("BNNS unavailable")
+    m, k = a_u16.shape
+    n, k2 = b_u16.shape
+    assert k == k2
+    ad = _desc2d(m, k, _DT_BF16, a_u16.ctypes.data)
+    bd = _desc2d(n, k, _DT_BF16, b_u16.ctypes.data)
+    cd = _desc2d(m, n, _DT_F32, c_f32.ctypes.data)
+    fp = _FilterParams()
+    fp.n_threads = 0
+    with _bnns_lock:
+        ws = _bnns_ws.get((m, k, n))
+        if ws is None:
+            sz = lib.BNNSMatMulWorkspaceSize(
+                False, True, 1.0, ctypes.byref(ad), ctypes.byref(bd),
+                ctypes.byref(cd), ctypes.byref(fp),
+            )
+            if sz < 0:
+                raise RuntimeError(f"BNNS workspace size {sz}")
+            ws = np.empty(max(int(sz), 1), dtype=np.uint8)
+            _bnns_ws[(m, k, n)] = ws
+        rc = lib.BNNSMatMul(
+            False, True, 1.0, ctypes.byref(ad), ctypes.byref(bd),
+            ctypes.byref(cd), ws.ctypes.data, ctypes.byref(fp),
+        )
+    if rc != 0:
+        raise RuntimeError(f"BNNSMatMul rc={rc}")
+
+
+# ---------------------------------------------------------------------------
+# NEON swiglu (libswiglu_neon.dylib; falls back to numpy)
+# ---------------------------------------------------------------------------
+
+_swiglu_lib = None
+
+
+def _get_swiglu_lib():
+    global _swiglu_lib
+    if _swiglu_lib is None:
+        try:
+            import pathlib
+
+            p = pathlib.Path(__file__).parent / "libswiglu_neon.dylib"
+            if p.exists():
+                lib = ctypes.CDLL(str(p))
+                lib.swiglu_neon.argtypes = [
+                    ctypes.POINTER(ctypes.c_float),
+                    ctypes.POINTER(ctypes.c_float),
+                    ctypes.POINTER(ctypes.c_float),
+                    ctypes.c_int,
+                ]
+                _swiglu_lib = lib
+            else:
+                _swiglu_lib = False
+        except Exception:
+            _swiglu_lib = False
+    return _swiglu_lib or None
+
+
+def _swiglu_f32(gate, up):
+    """gate*sigmoid(gate)*up, fp32, in/out contiguous numpy."""
+    lib = _get_swiglu_lib()
+    if lib is None:
+        return gate * (1.0 / (1.0 + np.exp(-gate))) * up
+    out = np.empty_like(gate)
+    lib.swiglu_neon(
+        gate.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        up.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        gate.size,
+    )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# CPU worker (single thread, zero MLX API calls)
+# ---------------------------------------------------------------------------
+
+
+_share_lib = None
+
+
+def _get_share_lib():
+    """Fused C library: one ctypes call per op -> GIL released for the whole
+    CPU share (a Python-level loop measured +40% wall time via GIL contention
+    with MLX's async dispatch thread)."""
+    global _share_lib
+    if _share_lib is None:
+        try:
+            import pathlib
+
+            p = pathlib.Path(__file__).parent / "libcpu_share.dylib"
+            if p.exists():
+                lib = ctypes.CDLL(str(p))
+                lib.mlp_cpu_share.restype = ctypes.c_int
+                lib.mlp_cpu_share.argtypes = [
+                    ctypes.POINTER(ctypes.c_uint16),
+                    ctypes.POINTER(ctypes.c_uint16),
+                    ctypes.POINTER(ctypes.c_uint16),
+                    ctypes.POINTER(ctypes.c_float),
+                    ctypes.POINTER(ctypes.c_float),
+                    ctypes.c_size_t,
+                    ctypes.c_size_t,
+                    ctypes.c_size_t,
+                    ctypes.c_size_t,
+                ]
+                lib.split_gemm_bf16.restype = None
+                lib.split_gemm_bf16.argtypes = [
+                    ctypes.POINTER(ctypes.c_uint16),
+                    ctypes.POINTER(ctypes.c_uint16),
+                    ctypes.POINTER(ctypes.c_float),
+                    ctypes.c_size_t,
+                    ctypes.c_size_t,
+                    ctypes.c_size_t,
+                ]
+                _share_lib = lib
+            else:
+                _share_lib = False
+        except Exception:
+            _share_lib = False
+    return _share_lib or None
+
+
+def _cpu_mlp(x_u16, wg_u16, wu_u16, wd_f32, out_f32, m, nc):
+    """MLP CPU share via one fused C call: BNNS gate/up (bf16, AMX) +
+    NEON swiglu + down K-slice sgemm. All buffers are numpy views."""
+    lib = _get_share_lib()
+    u16p = ctypes.POINTER(ctypes.c_uint16)
+    f32p = ctypes.POINTER(ctypes.c_float)
+    if lib is not None:
+        rc = lib.mlp_cpu_share(
+            x_u16.ctypes.data_as(u16p),
+            wg_u16.ctypes.data_as(u16p),
+            wu_u16.ctypes.data_as(u16p),
+            wd_f32.ctypes.data_as(f32p),
+            out_f32.ctypes.data_as(f32p),
+            m,
+            x_u16.shape[1],
+            nc,
+            out_f32.shape[1],
+        )
+        if rc != 0:
+            raise RuntimeError(f"mlp_cpu_share rc={rc}")
+        return
+    gate = np.empty((m, nc), dtype=np.float32)
+    up = np.empty((m, nc), dtype=np.float32)
+    _bnns_gemm_bf16(x_u16, wg_u16, gate)
+    _bnns_gemm_bf16(x_u16, wu_u16, up)
+    hidden = _swiglu_f32(gate, up)
+    np.matmul(hidden, wd_f32.T, out=out_f32)
+
+
+def _cpu_split_gemms(x_u16, jobs):
+    """jobs: (w_u16 [nc,K] bf16, out_f32 [M,nc] view of MLX fp32 buffer)."""
+    lib = _get_share_lib()
+    u16p = ctypes.POINTER(ctypes.c_uint16)
+    f32p = ctypes.POINTER(ctypes.c_float)
+    for w_u16, out_f32 in jobs:
+        if lib is not None:
+            lib.split_gemm_bf16(
+                x_u16.ctypes.data_as(u16p),
+                w_u16.ctypes.data_as(u16p),
+                out_f32.ctypes.data_as(f32p),
+                x_u16.shape[0],
+                x_u16.shape[1],
+                w_u16.shape[0],
+            )
+        else:
+            _bnns_gemm_bf16(x_u16, w_u16, out_f32)
+
+
+# ---------------------------------------------------------------------------
+# Hooks
+# ---------------------------------------------------------------------------
 
 
 def _hybrid_mlp_call(self, x):
     frac = _fraction()
-    B, S, K = x.shape
-    M = B * S
-
-    if frac <= 0 or M <= 32 or not isinstance(self.gate_proj, nn.QuantizedLinear):
-        return _orig_mlp_call(self, x)
-
-    M_cpu = max(8, int(M * frac)) & ~7
-    M_gpu = M - M_cpu
-    if M_gpu < 16:
+    b, s, k = x.shape
+    m = b * s
+    if (
+        frac <= 0
+        or m < _MIN_M
+        or not _bnns_init()
+        or not _lin_ok(self.gate_proj)
+        or not _lin_ok(self.up_proj)
+        or not _lin_ok(self.down_proj)
+    ):
         return _orig_mlp_call(self, x)
 
     try:
-        x_2d = x.reshape(M, K)
-        N_out = self.down_proj["weight"].shape[0]
+        from .models.activations import swiglu
 
-        # Pre-allocate output + get writable view (zero-copy)
-        out = mx.zeros((M, N_out), dtype=mx.bfloat16)
-        mx.eval(out)
-        out_np = np.frombuffer(memoryview(out), dtype=np.uint16).reshape(M, N_out)
+        i = self.gate_proj["weight"].shape[0]  # intermediate size
+        n_down = self.down_proj["weight"].shape[0]
+        # nc: CPU share of the intermediate dim (multiple of 64 for group-
+        # aligned K-slicing of down_proj's packed weights + scales)
+        nc = max(64, int(round(i * frac))) & ~63
+        if i - nc < 64 or m * nc < (1 << 18):
+            return _orig_mlp_call(self, x)
 
-        # Get dequantized weights (cached, zero-copy fp32 views)
-        wg, wu, wd = _get_weights(self)
+        x2 = x.reshape(m, k)
 
-        # Get zero-copy view of input (bf16 as uint16)
-        # CPU reads directly from unified memory — no GPU operation needed
-        x_mv = memoryview(x_2d)
+        # --- light GPU phase: dequant CPU weights + output buffer ---
+        wg_bf = mx.dequantize(
+            self.gate_proj["weight"][i - nc:],
+            self.gate_proj["scales"][i - nc:],
+            self.gate_proj["biases"][i - nc:],
+            group_size=64, bits=4,
+        ).astype(mx.bfloat16)
+        wu_bf = mx.dequantize(
+            self.up_proj["weight"][i - nc:],
+            self.up_proj["scales"][i - nc:],
+            self.up_proj["biases"][i - nc:],
+            group_size=64, bits=4,
+        ).astype(mx.bfloat16)
+        # down_proj K-slice (CPU gets the LAST nc columns of W):
+        # weight [N_down, I/8] packed, scales [N_down, I/64]
+        wd_f32 = mx.dequantize(
+            self.down_proj["weight"][:, (i - nc) // 8 :],
+            self.down_proj["scales"][:, (i - nc) // 64 :],
+            self.down_proj["biases"][:, (i - nc) // 64 :],
+            group_size=64, bits=4,
+        ).astype(mx.float32)
+        out_buf = mx.empty((m, n_down), dtype=mx.float32)
+        mx.async_eval([wg_bf, wu_bf, wd_f32, out_buf])
 
-        # Submit GPU work (lazy graph, runs when eval'd)
-        x_gpu = x_2d[:M_gpu]
-        gate_g = self.gate_proj(x_gpu)
-        up_g = self.up_proj(x_gpu)
-        hidden_g = gate_g * mx.sigmoid(gate_g) * up_g
-        out_gpu = self.down_proj(hidden_g)
+        x_u16 = _np_view(x2, np.uint16, m, k)
+        wg_u16 = _np_view(wg_bf, np.uint16, nc, k)
+        wu_u16 = _np_view(wu_bf, np.uint16, nc, k)
+        wd_np = _np_view(wd_f32, np.float32, n_down, nc)
+        out_np = _np_view(out_buf, np.float32, m, n_down)
+        # x2 must be materialized for the CPU to read
+        mx.eval(x2)
 
-        # CPU thread: 100% numpy + NEON, zero MLX calls, no GIL contention
-        def cpu_work():
-            x_u16 = np.frombuffer(x_mv, dtype=np.uint16).reshape(M, K)[M_gpu:]
-            x_np = (x_u16.astype(np.uint32) << 16).view(np.float32).reshape(M_cpu, K)
-            gate = x_np @ wg.T
-            up = x_np @ wu.T
-            hidden = _swiglu_fast(gate, up)  # NEON: 5x faster than numpy
-            return hidden @ wd.T  # (M_cpu, N_out) fp32
-
-        fut = _get_executor().submit(cpu_work)
-
-        # Evaluate GPU graph (runs in parallel with CPU thread)
-        out_gpu_bf = out_gpu.astype(mx.bfloat16)
-        mx.eval(out_gpu_bf)
-
-        # Convert CPU result to MLX (fast buffer copy) + concatenate
-        cpu_res = fut.result()
-        cpu_mx = mx.array(cpu_res).astype(mx.bfloat16).reshape(1, M_cpu, N_out)
-        result = mx.concatenate(
-            [out_gpu_bf.reshape(1, M_gpu, N_out), cpu_mx], axis=1
+        # --- heavy GPU phase: gate/up rows, swiglu, down K-slice ---
+        gate_gpu = mx.quantized_matmul(
+            x2, self.gate_proj["weight"][: i - nc],
+            self.gate_proj["scales"][: i - nc],
+            self.gate_proj["biases"][: i - nc],
+            transpose=True, group_size=64, bits=4,
         )
-        mx.eval(result)
-        return result
+        up_gpu = mx.quantized_matmul(
+            x2, self.up_proj["weight"][: i - nc],
+            self.up_proj["scales"][: i - nc],
+            self.up_proj["biases"][: i - nc],
+            transpose=True, group_size=64, bits=4,
+        )
+        hidden_gpu = swiglu(gate_gpu, up_gpu)
+        down_gpu = mx.quantized_matmul(
+            hidden_gpu,
+            self.down_proj["weight"][:, : (i - nc) // 8],
+            self.down_proj["scales"][:, : (i - nc) // 64],
+            self.down_proj["biases"][:, : (i - nc) // 64],
+            transpose=True, group_size=64, bits=4,
+        )
+        mx.async_eval([down_gpu])
 
-    except Exception as e:
-        logger.warning("cpu_prefill fallback: %s", e)
+        fut = _pool.submit(_cpu_mlp, x_u16, wg_u16, wu_u16, wd_np, out_np, m, nc)
+        fut.result()
+        return (down_gpu + out_buf.astype(mx.bfloat16)).reshape(b, s, k)
+    except Exception:
+        logger.warning("cpu_prefill mlp fallback", exc_info=True)
         return _orig_mlp_call(self, x)
-
-
-def _hybrid_delta_call(self, inputs, mask=None, cache=None):
-    """Coarse-grained M-split for delta-net input projections during prefill."""
-    from .models.qwen3_5.language import gated_delta_update, _qwen3_5_advance_lengths_info
-
-    frac = _fraction()
-    B, S, _ = inputs.shape
-
-    if frac <= 0 or S <= 32 or not isinstance(self.in_proj_qkv, nn.QuantizedLinear):
-        return _orig_delta_call(self, inputs, mask, cache)
-
-    try:
-        M_cpu = max(8, int(S * frac)) & ~7
-        M_gpu = S - M_cpu
-        if M_gpu < 16:
-            return _orig_delta_call(self, inputs, mask, cache)
-
-        K = inputs.shape[-1]
-        x_2d = inputs.reshape(S, K)
-        x_mv = memoryview(x_2d)
-
-        w_qkv = _get_weights(self.in_proj_qkv)
-
-        x_gpu = inputs[:, :M_gpu]
-        x_cpu = inputs[:, M_gpu:]
-        qkv_gpu = self.in_proj_qkv(x_gpu)
-
-        def cpu_work():
-            x_u16 = np.frombuffer(x_mv, dtype=np.uint16).reshape(S, K)[M_gpu:]
-            xn = (x_u16.astype(np.uint32) << 16).view(np.float32).reshape(M_cpu, K)
-            return xn @ w_qkv.T
-
-        fut = _get_executor().submit(cpu_work)
-        mx.eval(qkv_gpu)
-
-        qkv_cpu = fut.result()
-        dt = inputs.dtype
-        qkv_c = mx.array(qkv_cpu).astype(dt).reshape(1, M_cpu, -1)
-        mixed_qkv = mx.concatenate([qkv_gpu, qkv_c], axis=1)
-
-        # z/b/a 全走 GPU (不拆, 减少开销)
-        z = self.in_proj_z(inputs)
-        b = self.in_proj_b(inputs)
-        a = self.in_proj_a(inputs)
-        mx.eval(mixed_qkv, z, b, a)
-
-        # Sequential parts on GPU (from original __call__)
-        z = z.reshape(B, S, -1, self.head_v_dim)
-        if cache is not None and cache[0] is not None:
-            conv_state = cache[0]
-            if conv_state.shape[0] != B:
-                conv_state = mx.zeros((B, self.conv_kernel_size - 1, self.conv_dim), dtype=inputs.dtype)
-        else:
-            conv_state = mx.zeros((B, self.conv_kernel_size - 1, self.conv_dim), dtype=inputs.dtype)
-
-        if mask is not None:
-            if mask.shape[0] != B:
-                mask = None
-            else:
-                mixed_qkv = mx.where(mask[..., None], mixed_qkv, 0)
-
-        conv_input = mx.concatenate([conv_state, mixed_qkv], axis=1)
-        if cache is not None:
-            cache.update_window(0, conv_input, self.conv_kernel_size - 1, lengths=cache.lengths)
-
-        conv_out = nn.silu(self.conv1d(conv_input))
-        q, k, v = [
-            t.reshape(B, S, h, d)
-            for t, h, d in zip(
-                mx.split(conv_out, [self.key_dim, 2 * self.key_dim], -1),
-                [self.num_k_heads, self.num_k_heads, self.num_v_heads],
-                [self.head_k_dim, self.head_k_dim, self.head_v_dim],
-            )
-        ]
-        q, k = self._normalize_qk(q, k)
-        out, _ = gated_delta_update(q, k, v, a, b, self.A_log, self.dt_bias,
-                                    mask=mask, use_kernel=not self.training, cache=cache)
-        if cache is not None:
-            if hasattr(cache, "advance"):
-                cache.advance(S)
-                _qwen3_5_advance_lengths_info(cache, S)
-        out = self.norm(out, z)
-        return self.out_proj(out.reshape(B, S, -1))
-
-    except Exception as e:
-        logger.warning("cpu_prefill delta fallback: %s", e)
-        return _orig_delta_call(self, inputs, mask, cache)
 
 
 def install():
-    global _orig_mlp_call, _orig_delta_call, _installed
+    global _orig_mlp_call, _installed
     if _installed or _fraction() <= 0:
         return
-    from .models.qwen3_5.language import Qwen3_5MLP, Qwen3_5GatedDeltaNet
-    from .models.qwen3_5.language import gated_delta_update, _qwen3_5_advance_lengths_info
+    if not _bnns_init():
+        return
+    from .models.qwen3_5.language import Qwen3_5MLP
 
     _orig_mlp_call = Qwen3_5MLP.__call__
     Qwen3_5MLP.__call__ = _hybrid_mlp_call
-    _orig_delta_call = Qwen3_5GatedDeltaNet.__call__
-    Qwen3_5GatedDeltaNet.__call__ = _hybrid_delta_call
     _installed = True
-    logger.info("cpu_prefill installed: frac=%.2f (MLP + delta-net in_proj)", _fraction())
+    logger.info(
+        "cpu_prefill v3.1 installed: frac=%.3f (MLP K-split only)",
+        _fraction(),
+    )
 
 
 def maybe_install():
