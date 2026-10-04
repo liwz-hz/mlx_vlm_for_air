@@ -105,17 +105,12 @@ def _hybrid_mlp_call(self, x):
 
         # CPU thread: 100% numpy, zero MLX calls, no GIL contention
         def cpu_work():
-            # Read bf16 input as uint16 from unified memory (zero-copy)
             x_u16 = np.frombuffer(x_mv, dtype=np.uint16).reshape(M, K)[M_gpu:]
-            # bf16 → fp32 (bit shift, CPU-side, no GPU)
             x_np = (x_u16.astype(np.uint32) << 16).view(np.float32).reshape(M_cpu, K)
-            # MLP: 3 matmuls + swiglu (Accelerate BLAS/AMX)
             gate = x_np @ wg.T
             up = x_np @ wu.T
-            hidden = gate * (1.0 / (1.0 + np.exp(-gate.astype(np.float32)))) * up
-            result = hidden @ wd.T
-            # fp32 → bf16, write DIRECTLY into MLX output buffer (zero-copy)
-            out_np[M_gpu:, :] = (result.view(np.uint32) >> 16).astype(np.uint16)
+            hidden = gate * (1.0 / (1.0 + np.exp(-gate))) * up
+            return hidden @ wd.T  # (M_cpu, N_out) fp32
 
         fut = _get_executor().submit(cpu_work)
 
@@ -123,16 +118,14 @@ def _hybrid_mlp_call(self, x):
         out_gpu_bf = out_gpu.astype(mx.bfloat16)
         mx.eval(out_gpu_bf)
 
-        # Copy GPU result into output buffer (unified memory memcpy)
-        gpu_np = np.frombuffer(
-            memoryview(out_gpu_bf), dtype=np.uint16
-        ).reshape(M_gpu, N_out)
-        out_np[:M_gpu, :] = gpu_np
-
-        # Wait for CPU
-        fut.result()
-
-        return out.reshape(B, S, N_out)
+        # Convert CPU result to MLX (fast buffer copy) + concatenate
+        cpu_res = fut.result()
+        cpu_mx = mx.array(cpu_res).astype(mx.bfloat16).reshape(1, M_cpu, N_out)
+        result = mx.concatenate(
+            [out_gpu_bf.reshape(1, M_gpu, N_out), cpu_mx], axis=1
+        )
+        mx.eval(result)
+        return result
 
     except Exception as e:
         logger.warning("cpu_prefill fallback: %s", e)
