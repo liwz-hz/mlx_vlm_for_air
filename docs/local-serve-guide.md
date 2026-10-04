@@ -52,9 +52,7 @@ modelscope download --model mlx-community/Qwen3.8-27B-MTP-4bit   # MTP drafter�
 pip install mlx==0.32.2 mlx-metal==0.32.2   # 0.32.2 的 M=4 skinny GEMV 比 0.31.2 快 67%
 ```
 
-## 2. 硬件规格与性能实测
-
-### 2.1 系统信息（来源：`system_profiler SPHardwareDataType`）
+## 3. 硬件规格与性能实测
 
 | 项目 | 值 | 获取命令 |
 |---|---|---|
@@ -64,7 +62,7 @@ pip install mlx==0.32.2 mlx-metal==0.32.2   # 0.32.2 的 M=4 skinny GEMV 比 0.3
 | CPU 核心 | 10 = 4 性能核 + 6 能效核 | `sysctl hw.perflevel0.physicalcpu hw.perflevel1.physicalcpu` |
 | GPU 核心 | 10 | `ioreg -l \| grep gpu-core-count` |
 
-### 2.2 CPU 算力
+### 3.1 CPU 算力
 
 | 指标 | 值 | 来源 |
 |---|---|---|
@@ -90,7 +88,45 @@ print(f'CPU fp32 GEMM: {2*400*5120*17408/t/1e9:.0f} GFLOPS')
 "
 ```
 
-### 2.3 GPU 算力
+### 3.2 AMX vs NEON：CPU 内两种计算单元
+
+Apple Silicon 的每个性能核（P-core）内有两套计算单元：
+
+| | NEON (SIMD) | AMX (矩阵协处理器) |
+|---|---|---|
+| **是什么** | 128-bit 向量 SIMD 指令集 | 512-bit 专用矩阵乘法单元 |
+| **每指令操作** | 4×fp32 FMA = **8 FLOP** | 16×16 矩阵 FMA = **512 FLOP** |
+| **理论峰值** (4核×4.5GHz) | 144 GFLOPS | **9,216 GFLOPS** |
+| **实测** (fp32 GEMM) | ~40 GFLOPS (估) | **1,062 GFLOPS** |
+| **比值** | 1× | **64×** |
+| **擅长** | 整数/逐元素/位移/解包 | 密集矩阵乘法 |
+| **不擅长** | 大规模 GEMM | 整数运算、元素级操作 |
+
+**获取方法**：
+```bash
+# AMX: numpy 矩阵乘法自动调用 Accelerate BLAS → AMX
+python3 -c "
+import numpy as np, time
+a = np.random.randn(100, 5120).astype(np.float32)
+b = np.random.randn(4096, 5120).astype(np.float32)
+c = a @ b.T  # 预热
+t0 = time.perf_counter(); c = a @ b.T
+print(f'AMX: {2*100*5120*4096/(time.perf_counter()-t0)/1e9:.0f} GFLOPS')
+"
+```
+
+**在 LLM 推理中的分工**：
+
+| 操作 | 应该用 | 原因 |
+|---|---|---|
+| 权重×输入 矩阵乘法 | **AMX** | 密集 GEMM，AMX 快 64× |
+| 4bit 权重解包 (shift/mask) | **NEON** | 纯整数位操作，AMX 不支持 |
+| swiglu/sigmoid 激活 | **NEON** | 逐元素操作，无矩阵结构 |
+| argmax 采样 | **NEON** | 比较/选择，非矩阵乘 |
+
+**AMX + NEON 交叉并行的理论可行性**：两者是 P-core 内**独立的执行管线**，可以同时执行。理论上可以构建流水线：NEON 解包第 N+1 块 4bit 权重 → AMX 用第 N 块已解包权重做矩阵乘。但这需要汇编级编程（C 编译器无法自动生成混合 AMX/NEON 指令流水线），工程复杂度极高。当前通过 Accelerate BLAS 调用 AMX 已经是实际最优方案。
+
+### 3.3 GPU 算力
 
 | 指标 | 值 | 来源 |
 |---|---|---|
@@ -139,7 +175,7 @@ sudo powermetrics --samplers gpu_power -i 1000 -n 3
 # 输出 GPU HW active frequency, GPU Power, residency per frequency bin
 ```
 
-### 2.4 内存带宽
+### 3.4 内存带宽
 
 | 指标 | 值 | 来源 |
 |---|---|---|
@@ -152,7 +188,7 @@ sudo powermetrics --samplers gpu_power -i 1000 -n 3
 
 **推算说明**：Apple 不公开 M5 的内存速度。从实测 GEMV 105.2 GB/s（含反量化开销，有效带宽低于总线峰值）和 M4（基础版）120 GB/s 的公开规格推断，M5（基础版）的理论内存带宽约 120-150 GB/s。
 
-### 2.5 LPM 开启/关闭对比
+### 3.5 LPM 开启/关闭对比
 
 | 指标 | LPM 开启 | LPM 关闭 | 差异 |
 |---|---|---|---|
@@ -166,7 +202,7 @@ sudo powermetrics --samplers gpu_power -i 1000 -n 3
 
 **LPM 状态检查**：`pmset -g | grep lowpower`（0=关，1=开）
 
-### 2.6 各阶段实测性能汇总（无 LPM + mlx 0.32.2）
+### 3.6 各阶段实测性能汇总（无 LPM + mlx 0.32.2）
 
 | 层级 | 操作 | 性能 |
 |---|---|---|
@@ -181,7 +217,7 @@ sudo powermetrics --samplers gpu_power -i 1000 -n 3
 | 端到端 | prefill（M=3518, 首次） | ~200 tok/s |
 | 端到端 | prefill（APC 命中后） | ~0.2s TTFT |
 
-### 2.7 显存/内存预算
+### 3.7 显存/内存预算
 
 | 组件 | 占用 |
 |---|---|
@@ -191,9 +227,9 @@ sudo powermetrics --samplers gpu_power -i 1000 -n 3
 
 32GB 机器上，权重 + KV + 系统必须有充足余量。
 
-## 3. 启动推理服务
+## 4. 启动推理服务
 
-### 3.1 推荐配置（全优化，实测 20 tok/s）
+### 4.1 推荐配置（全优化，实测 20 tok/s）
 
 ```bash
 APC_ENABLED=1 APC_NUM_BLOCKS=4096 \
@@ -215,7 +251,7 @@ nohup python -m mlx_vlm.server \
 | `--draft-model` + 自动识别 `--draft-kind mtp` | MTP 投机解码 | decode 2.9→5.1 tok/s |
 | `--draft-block-size 4` | 每轮验证 4 个 draft token（默认 3） | 5.1→5.9 tok/s（无LPM: 16.8→19.1） |
 
-## 4. API 调用
+## 5. API 调用
 
 ```bash
 # 查看可用模型（loaded: true 的才是已加载的）
@@ -235,7 +271,7 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
 
 响应里的 `timings` 字段是性能诊断金矿：`prompt_per_second`、`predicted_per_second`、`peak_memory`、`cached_tokens`、`draft_rounds/draft_n_accepted`（投机解码接受率）。
 
-## 5. opencode 接入
+## 6. opencode 接入
 
 `~/.config/opencode/opencode.json` 配置（OpenAI 兼容 provider）：
 
@@ -267,9 +303,9 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
 2. **limits 必须与服务端对齐**：服务端静态校验 `prompt + max_tokens ≤ MAX_KV_SIZE`
 3. 配置修改后需**重启 opencode** 生效
 
-## 6. 性能调优
+## 7. 性能调优
 
-### 6.1 本机 LLM 推理的本质
+### 7.1 本机 LLM 推理的本质
 
 LLM 推理分两个阶段，**瓶颈完全不同**：
 
@@ -282,7 +318,7 @@ LLM 推理分两个阶段，**瓶颈完全不同**：
 
 **为什么 prefill 阶段 CPU 能帮忙**：prefill 一次处理全部 prompt token（如 4000 个），权重只读一遍但算 4000 次乘加。GPU 算力满载（95%），但内存带宽只用 ~15%（权重读一遍 15.2GB / 4000 token 计算时间）。CPU 的 AMX 协处理器（~1.4 TFLOPS）可以并行处理部分 token 的矩阵乘法，与 GPU 争抢的不是带宽而是各自独立的算力。
 
-### 6.2 优化手段（按收益排序）
+### 7.2 优化手段（按收益排序）
 
 | 优先级 | 手段 | 阶段 | 收益 | 成本 |
 |---|---|---|---|---|
@@ -296,7 +332,7 @@ LLM 推理分两个阶段，**瓶颈完全不同**：
 
 **最终配置实测（3 轮中位）**：**20.01 tok/s**（计数任务），代码任务 18.3，知识问答 10.6。
 
-### 6.3 CPU/GPU Prefill 协同（`MLX_VLM_CPU_PREFILL`）
+### 7.3 CPU/GPU Prefill 协同（`MLX_VLM_CPU_PREFILL`）
 
 **原理**：prefill 是算力瓶颈（GPU 95% 满载），CPU AMX 协处理器有 ~1.4 TFLOPS 闲着。按 token 维度切分——GPU 算 90% 的 token（走 4bit 量化 kernel），CPU 算 10% 的 token（走 fp32 BLAS/AMX），两者完全并行。
 
@@ -328,7 +364,7 @@ LLM 推理分两个阶段，**瓶颈完全不同**：
 - 用 `memoryview(mx_array)` 零拷贝读取统一内存中的 bf16 输入（0.01ms vs tolist 的 58ms）
 - CPU 结果通过 `mx.array(numpy)` + `mx.concatenate` 合并（~2ms，不用预分配 buffer 避免并发写入问题）
 
-### 6.3 各层性能数据（无 LPM + mlx 0.32.2）
+### 7.4 各层性能数据（无 LPM + mlx 0.32.2）
 
 | 层级 | 指标 |
 |---|---|
@@ -338,7 +374,7 @@ LLM 推理分两个阶段，**瓶颈完全不同**：
 | fork verify kernel T=4 | 69-75 GB/s |
 | 端到端（全配置） | 20.0 tok/s |
 
-### 6.4 已验证无效的方向
+### 7.5 已验证无效的方向
 
 - `mx.set_wired_limit`（权重锁页）：无增益
 - 整步 `mx.compile`：GPU 活跃度已 100%，无调度空隙
@@ -348,7 +384,7 @@ LLM 推理分两个阶段，**瓶颈完全不同**：
 - DVFS 时钟保持器（`mlx_vlm/clock_keeper.py`）：微基准 +18%，端到端持平
 - draft-block-size ≥ 6：接受率 79%→29% 崩塌
 
-### 6.5 mlx.fast 陷阱（改 kernel 前必读）
+### 7.6 mlx.fast 陷阱（改 kernel 前必读）
 
 1. `grid` 参数是**总线程数**（不是 threadgroup 数）
 2. 同一 kernel 对象跨模板参数复用会得到**错误结果**（必须按 shape 缓存）
@@ -356,7 +392,7 @@ LLM 推理分两个阶段，**瓶颈完全不同**：
 4. MSL 2D thread 数组在部分展开下降级到**未同步内存副本** → 全 NaN
 5. 运行时编译 kernel 的名称**不含源码哈希**——修改源码后 JIT 缓存可能关联坏二进制（需重启清除）
 
-### 6.6 内存压力诊断
+### 7.7 内存压力诊断
 
 ```bash
 sysctl vm.swapusage          # swap >0 且增长 = 压力
@@ -364,13 +400,13 @@ vm_stat | grep "Pages free"  # <500MB = 危险
 footprint <server_pid>       # 真实占用（含 Metal）
 ```
 
-### 6.7 投机解码说明
+### 7.8 投机解码说明
 
 - Qwen3.5/3.8 架构原生带 MTP，drafter 分片单独发布（238MB）
 - 本仓库 `mlx_vlm/speculative/drafters/qwen3_5_mtp/` 有完整实现
 - drafter 与 target 必须出自同一原始 checkpoint
 
-## 7. 常见坑速查
+## 8. 常见坑速查
 
 | 现象 | 原因与解决 |
 |---|---|
@@ -383,7 +419,7 @@ footprint <server_pid>       # 真实占用（含 Metal）
 | opencode 报模型找不到 | provider/model 需双斜杠 |
 | 接受率崩塌（accepted≈1-6） | 删除 `~/.cache/mlx-vlm/apc` 后重启 |
 
-## 8. 性能预期参考（M5 Air 32GB / Qwen3.8-27B-4bit）
+## 9. 性能预期参考（M5 Air 32GB / Qwen3.8-27B-4bit）
 
 | 场景 | LPM 开启 | **LPM 关闭** |
 |---|---|---|
