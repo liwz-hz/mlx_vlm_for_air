@@ -502,7 +502,26 @@ footprint <server_pid>       # 真实占用（含 Metal）
 **微基准 +6~8%（MLP 单算子，同热状态交替基线）在持续负载下被 2+3 吞噬。数值上 CPU fp32/bf16
 路径更精确（greedy 输出前缀 3/3 一致），但性能为负，默认关闭。**
 
-### 10.3 剩余真实优化空间（按投入产出排序）
+### 10.4 Batch=2 实测：合并 batch 生效但 verify 慢路径使其净负收益（2026-10-04）
+
+| 指标 | solo | batch=2 |
+|---|---|---|
+| 每流 decode | 10-11.3 tok/s | 4.2 tok/s（总吞吐 0.73-0.81×，**更差**） |
+| 轮数 | 15 | 15（两流共享同一批轮次 = 真合并） |
+| 接受率 | 14/45 | 14/43（无退化） |
+| 每轮耗时 | 175ms | **400ms（2.3×）** |
+
+结论：continuous batching + `_mtp_rounds_batch` 的多行 MTP 路径**架构上正确**（合并 verify、
+接受率不塌），但 B=2 的每轮成本是 B=1 的 2.3×，吃掉全部权重摊销收益。嫌疑在
+`Qwen3_5BatchInvariantForward` 的 B≥2 路径（verifier 内 kernel dispatch，需专项 profiling）。
+**修掉后 batch=2 预期总吞吐 ~1.9×（每流 ~11 tok/s）**。当前状态：并发请求会互相拖慢，
+单流场景保持 batch=1。
+prefill 侧无 batch 收益（算力已 92-95% 峰值，M=2048 与 M=4096 的 qmm 吞吐实测相同）。
+
+注意：LPM（低电量模式）下 decode 从 ~11 掉到 3.5 tok/s（GPU 带宽被钳到 25-35GB/s），
+跑性能测试前确认 `pmset -g | grep lowpower` 为 0 且接通电源。
+
+### 10.5 剩余真实优化空间（按投入产出排序）
 
 1. **delta core 融合分块 kernel**：现 kernel 对 T 串行扫描（0.48 TFLOPS，26× 低于 GPU 能力上限）；
    FLA 风格 chunk-parallel 融合 kernel 理论可到 3+ TFLOPS → prefill **-4~5%**。工程量大（正确性验证难）。
