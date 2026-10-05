@@ -222,8 +222,12 @@ sudo powermetrics --samplers gpu_power -i 1000 -n 3
 | 组件 | 占用 |
 |---|---|
 | 27B 4bit 权重 | ~15.2GB（每 token 解码全量读取） |
-| KV cache（fp16，64 层/GQA 4 头/head_dim 256） | 262KB/token |
-| KV cache（`--kv-bits 8`） | 131KB/token |
+| KV cache（bf16，仅 16 个全注意力层记 KV/GQA 4 头/head_dim 256；另 48 层 delta-net 无 per-token KV） | 64KB/token |
+| KV cache（`--kv-bits 8`） | 32KB/token |
+
+注（2026-10 修正）：早期按"64 层全注意力"误估为 262/131KB per token；实测
+（`--max-kv-size 98304` 满载 KV ≈ 3GB @ kv8）证实只有 16 个全注意力层产生
+per-token KV，正确值为 64/32KB。
 
 32GB 机器上，权重 + KV + 系统必须有充足余量。
 
@@ -344,11 +348,15 @@ LLM 推理分两个阶段，**瓶颈完全不同**：
 | 3 | `--draft-block-size 4` | decode | 5.1→5.9 | 0 |
 | 4 | APC 前缀缓存 | prefill | TTFT 4.8s→0.2s | 0 |
 | 5 | KV 8bit + max-kv-size | 全局 | 防内存失控 | 0 |
-| 6 | CPU/GPU prefill 协同 | prefill | MLP +8% → prefill +5% | 0（`MLX_VLM_CPU_PREFILL=0.10`） |
+| 6 | CPU/GPU prefill 协同 | prefill | 算子级 +6~8%；**端到端为负**（§10.2，默认关） | 0（`MLX_VLM_CPU_PREFILL=0.10`） |
 
 **最终配置实测（3 轮中位）**：**20.01 tok/s**（计数任务），代码任务 18.3，知识问答 10.6。
 
 ### 7.3 CPU/GPU Prefill 协同（`MLX_VLM_CPU_PREFILL`）
+
+> **2026-10 更新**：本节数字为早期冷机短脉冲口径。后续同热状态严格 A/B 复测
+> （§10.2）显示端到端为**负收益**（-2.6% ~ -11.8%），该功能默认关闭。
+> 下文保留为过程记录。
 
 **原理**：prefill 是算力瓶颈（GPU 95% 满载），CPU AMX 协处理器有 ~1.4 TFLOPS 闲着。按 token 维度切分——GPU 算 90% 的 token（走 4bit 量化 kernel），CPU 算 10% 的 token（走 fp32 BLAS/AMX），两者完全并行。
 
@@ -421,6 +429,8 @@ footprint <server_pid>       # 真实占用（含 Metal）
 - Qwen3.5/3.8 架构原生带 MTP，drafter 分片单独发布（238MB）
 - 本仓库 `mlx_vlm/speculative/drafters/qwen3_5_mtp/` 有完整实现
 - drafter 与 target 必须出自同一原始 checkpoint
+- **验证为强贪心**（target argmax，`speculative_argmax_from_hidden`）：开 MTP 时输出锚定贪心轨迹，
+  温度/top-p 采样失效；需要采样多样性的任务请关闭 `--draft-model`
 
 ## 8. 常见坑速查
 
