@@ -249,7 +249,7 @@ nohup python -m mlx_vlm.server \
 | `--kv-bits 8` | KV cache 8bit 量化 | KV 内存减半 |
 | `--max-kv-size 98304` | KV token 上限 96K（原 48K，2026-10 翻倍） | 满载 KV ≈ 3GB；峰值内存 ≈ 24GB 仍安全 |
 | `--draft-model` + 自动识别 `--draft-kind mtp` | MTP 投机解码 | decode 2.9→5.1 tok/s |
-| `--draft-block-size 4` | 每轮验证 4 个 draft token（默认 3） | 5.1→5.9 tok/s（无LPM: 16.8→19.1） |
+| `--draft-block-size 4` | 每轮 verify 块总长 4 = 锚点 + **3 个草稿**（默认 3 = 锚点 + 2 草稿；实测 draft_n=3.0/轮） | 5.1→5.9 tok/s（无LPM: 16.8→19.1） |
 
 注：`max_kv_size` 是 live knob（改后无需重载模型）。APC 块池 4096 块 = 64K token 前缀缓存；
 若需缓存完整 96K 前缀可提 `APC_NUM_BLOCKS=6144`（满载 +1GB）。
